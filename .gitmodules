@@ -4,3 +4,6 @@
 [submodule "app/llama.cpp"]
 	path = app/llama.cpp
 	url = git@gitlab.lrz.de:00000000014A6BD7/llama.cpp-rknn.git
+[submodule "app/miniduckdb-httpfs"]
+	path = app/miniduckdb-httpfs
+	url = https://github.com/duckdb/duckdb-httpfs.git

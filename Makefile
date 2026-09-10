@@ -162,8 +162,16 @@ conf_interrupt_stack_size=0x1000
 # --- device drivers --------------------------------------------------------
 conf_drivers_acpi=1
 conf_drivers_pci=1
-# Off until the ENA port is brought up to the current memory and PCI APIs.
-conf_drivers_ena=0
+# On: modules/mininet drives this NIC, and the port to the current memory and
+# PCI APIs works -- verified on a c6in.8xlarge at 30 Gbps, byte-exact.
+#
+# This is only half the switch. Whether arch/x64/arch-setup.cc registers the
+# driver at all is gated separately on CONF_drivers_ena in the checked-in
+# include/osv/drivers_config.h (Makefile:893 -- nothing generates it). Setting
+# only this one compiles and links the driver but never probes it, and the
+# guest then reports "no usable NIC" with no ENA diagnostics at all, because
+# ena_log_level defaults to ENA_WARN and hides them. Change both together.
+conf_drivers_ena=1
 conf_drivers_nvme=1
 # vAccel needs virtio transport drivers (bus, vring, PCI).
 conf_drivers_virtio=1
@@ -605,18 +613,30 @@ endif
 # objects in $(app-objects); the kernel compiles and links them with its own
 # flags. Only one can be linked at a time -- two osv_app_main() would collide.
 #
-#   make                    -> app/, the placeholder app.cc
-#   make app=test           -> the test suite in test/
-#   make app=app/miniduckdb -> DuckDB    (submodule)
-#   make app=app/llama.cpp  -> llama.cpp (submodule)
-#   make app=<directory>    -> that directory, in the tree or out of it
+#   make                 -> app/, the placeholder app.cc
+#   make app=test        -> the test suite in test/
+#   make app=duckdb      -> DuckDB    (the app/miniduckdb submodule)
+#   make app=llama       -> llama.cpp (the app/llama.cpp submodule)
+#   make app=<directory> -> that directory, in the tree or out of it
 #
 # A directory is all an application is: its Makefile derives the rest of the
 # tree from its own path, so the same source builds in place or copied to app/.
 # The nix layer relies on the latter -- it stages an app source there and runs
 # plain `make`. A submodule needs 'git submodule update --init' first.
+#
+# The two submodules are named rather than given as directories because each
+# carries its *upstream* Makefile at its root -- DuckDB's drives cmake -- and
+# including that instead of the miniOSv fragment beside it builds the wrong
+# thing entirely.
+app-mk-duckdb = app/miniduckdb/miniosv/miniosv.mk
+app-mk-llama = app/llama.cpp/miniosv/miniosv.mk
 app ?= app
-include $(app)/Makefile
+app-mk := $(or $(app-mk-$(app)),$(app)/Makefile)
+ifeq ($(wildcard $(app-mk)),)
+$(error no $(app-mk) for app '$(app)': give a directory holding a Makefile, or \
+one of the named apps above)
+endif
+include $(app-mk)
 objects += $(app-objects)
 
 # Record the selected app so that switching between `make` and `make app=test`
