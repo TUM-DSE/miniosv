@@ -88,12 +88,28 @@ int device::open(int nvme_id)
     _block_size = _lba_size;
     _lbas_per_block = 1;
 
+    // What one command may carry: the controller's MDTS, and never more than a
+    // single PRP list can address (prp1 plus 511 entries). A transfer past
+    // either is rejected with "invalid field in command".
+    constexpr size_t prp_limit = 511 * NVME_PAGESIZE;
+    const size_t mdts = drv->max_transfer_bytes();
+    _max_bytes = (mdts && mdts < prp_limit) ? mdts : prp_limit;
+
     _queues = queues_for(nvme_id, drv);
     if (!_queues || _queues->empty()) {
         printf("miniext: could not create any NVMe I/O queue\n");
         return -EIO;
     }
     return 0;
+}
+
+uint32_t device::max_blocks() const
+{
+    if (!_block_size) {
+        return 1;
+    }
+    size_t n = _max_bytes / _block_size;
+    return n ? static_cast<uint32_t>(n) : 1;
 }
 
 // The queue set for a controller, created on first use and kept for the life of
@@ -186,7 +202,44 @@ bool device::in_range(uint64_t block, uint32_t count) const
     return false;
 }
 
+// Both submit paths cut the request into commands the controller accepts. A
+// caller reads as much as one extent run holds, which is far past that.
 int device::submit(void *buf, uint64_t block, uint32_t count, bool write)
+{
+    const uint32_t most = max_blocks();
+    auto *p = static_cast<uint8_t *>(buf);
+    while (count) {
+        const uint32_t here = count < most ? count : most;
+        int rc = submit_one(p, block, here, write);
+        if (rc < 0) {
+            return rc;
+        }
+        p += static_cast<size_t>(here) * _block_size;
+        block += here;
+        count -= here;
+    }
+    return 0;
+}
+
+int device::submit_async(void *buf, uint64_t block, uint32_t count, bool write,
+                         io_group &g)
+{
+    const uint32_t most = max_blocks();
+    auto *p = static_cast<uint8_t *>(buf);
+    while (count) {
+        const uint32_t here = count < most ? count : most;
+        int rc = submit_one_async(p, block, here, write, g);
+        if (rc < 0) {
+            return rc;
+        }
+        p += static_cast<size_t>(here) * _block_size;
+        block += here;
+        count -= here;
+    }
+    return 0;
+}
+
+int device::submit_one(void *buf, uint64_t block, uint32_t count, bool write)
 {
     if (!_queues || _queues->empty()) {
         return -ENODEV;
@@ -236,8 +289,8 @@ int device::submit(void *buf, uint64_t block, uint32_t count, bool write)
 
 // Place the command and leave. The group is what the completion finds its way
 // back to, and it is held from here until the interrupt drops it.
-int device::submit_async(void *buf, uint64_t block, uint32_t count, bool write,
-                         io_group &g)
+int device::submit_one_async(void *buf, uint64_t block, uint32_t count, bool write,
+                             io_group &g)
 {
     if (!_queues || _queues->empty()) {
         return -ENODEV;

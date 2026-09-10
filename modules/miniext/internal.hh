@@ -80,6 +80,10 @@ private:
                                                  nvme::nvme_driver *drv);
     int submit(void *buf, uint64_t block, uint32_t count, bool write);
     int submit_async(void *buf, uint64_t block, uint32_t count, bool write, io_group &g);
+    int submit_one(void *buf, uint64_t block, uint32_t count, bool write);
+    int submit_one_async(void *buf, uint64_t block, uint32_t count, bool write, io_group &g);
+    // Blocks one command may carry, from the controller's transfer limit.
+    uint32_t max_blocks() const;
     int bounce(void *buf, uint64_t block, uint32_t count, bool write);
     bool in_range(uint64_t block, uint32_t count) const;
     queue &pick();
@@ -89,6 +93,7 @@ private:
     uint64_t _lba_count = 0;
     uint32_t _block_size = 0;
     uint32_t _lbas_per_block = 0;
+    size_t _max_bytes = 0;      // most one command may transfer
 };
 
 // --- scratch buffers ----------------------------------------------------
