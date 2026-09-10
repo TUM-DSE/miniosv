@@ -72,8 +72,6 @@ static inter_processor_interrupt flush_ipi{IPI_TLB_FLUSH, [] {
  */
 static void shootdown(const uintptr_t *va, size_t count)
 {
-    static std::vector<sched::cpu*> ipis(sched::max_cpus);
-
     auto flush_here = [va, count] {
         if (va) {
             tlb_flush_pages(va, count);
@@ -90,39 +88,15 @@ static void shootdown(const uintptr_t *va, size_t count)
     SCOPE_LOCK(migration_lock);
     std::lock_guard<mutex> guard(flush_mutex);
     flush_waiter.reset(*sched::thread::current());
-    int confirms;
-    if (sched::thread::current()->is_app()) {
-        ipis.clear();
-        std::copy_if(sched::cpus.begin(), sched::cpus.end(), std::back_inserter(ipis),
-                [](sched::cpu* c) {
-            if (c == sched::cpu::current()) {
-                return false;
-            }
-
-            c->lazy_flush_tlb.store(true, std::memory_order_seq_cst);
-            if (!c->app_thread.load(std::memory_order_seq_cst)) {
-                return false;
-            }
-            if (!c->lazy_flush_tlb.exchange(false, std::memory_order_seq_cst)) {
-                return false;
-            }
-            return true;
-        });
-        confirms = ipis.size();
-    } else {
-        confirms = sched::cpus.size() - 1;
-    }
+    // Every cpu, whatever it runs: kernel memory is unmapped and reused too
+    // (the heap gives its pages back), so a cpu running a kernel thread may
+    // hold a stale entry and touch it before it next switches threads.
+    int confirms = sched::cpus.size() - 1;
 
     flush_va_count.store(count, std::memory_order_relaxed);
     flush_va.store(va, std::memory_order_release);
     flush_pendingconfirms.store(confirms);
-    if (confirms == (int)sched::cpus.size() - 1) {
-        flush_ipi.send_allbutself();
-    } else {
-        for (auto&& c: ipis) {
-            flush_ipi.send(c);
-        }
-    }
+    flush_ipi.send_allbutself();
 
     flush_here();
 

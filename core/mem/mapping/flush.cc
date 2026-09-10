@@ -20,6 +20,10 @@ static std::atomic<uint64_t> begun, done;
 
 uint64_t flush_epoch()
 {
+    // The caller has just cleared entries. They must be visible to every
+    // page-table walker before a flush another cpu begins from here on is
+    // counted as having covered them.
+    pte_barrier();
     return begun.load(std::memory_order_seq_cst);
 }
 

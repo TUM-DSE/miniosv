@@ -9,7 +9,7 @@ The two in-tree clients of the primitive layers. See
 
 `#include <osv/mem/heap.hh>`. Bump allocator inspired by BareHeap[DaMoN'26].
 
-By default, the libc functions related to memory allocationGeneral-purpose allocator behind `malloc`, `new` and `aligned_alloc`.
+The general-purpose allocator behind `malloc`, `new` and `aligned_alloc`.
 
 | Function | Does |
 |---|---|
@@ -116,7 +116,7 @@ The page cache offers several notable guarantees compared to POSIX `mmap`:
 - A cache region can have its own memory limit and custom policies.
 - Passive prefetching happens at fault-time, guided by a policy. A prefetched buffer is installed later without a read.
 - The cache tries to use as many big (2 MiB) frames where a buffer allows it. 
-- Per-mapping counters and fault timings, compiled in on demand.
+- Counters and fault timings, compiled in on demand.
 
 ## A fault
 
