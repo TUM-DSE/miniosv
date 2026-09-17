@@ -233,6 +233,32 @@ uint32_t read_cmdline(EFI_HANDLE image, char *out, uint32_t cap)
     return len;
 }
 
+#if defined(__aarch64__)
+// Push [start, end) out of the data caches to the point of coherency and drop
+// the instruction cache. The kernel image is written through the firmware's
+// cacheable mapping, so its bytes can still sit dirty in this CPU's data cache
+// when we jump to it. The kernel entry (arch/aarch64/boot.S) then runs with
+// the MMU off: instruction fetches don't see dirty data-cache lines (a line
+// that is only in L1D yields whatever memory held before - typically zeros,
+// i.e. an undefined instruction), and MMU-off data accesses (zero_bss, the
+// boot page-table fixups) go straight to memory. This is what firmware image
+// loaders do for the PE images they load (clean to PoU), plus the point of
+// coherency for the MMU-off data accesses. Under KVM the SCTLR write that
+// disables the MMU is not trapped, so the hypervisor does not flush for us.
+void clean_to_poc_and_invalidate_icache(uint64_t start, uint64_t end)
+{
+    uint64_t ctr;
+    asm volatile("mrs %0, ctr_el0" : "=r"(ctr));
+    uint64_t line = 4ull << ((ctr >> 16) & 0xf);   // DminLine, in words
+    for (uint64_t p = start & ~(line - 1); p < end; p += line)
+        asm volatile("dc civac, %0" : : "r"(p) : "memory");
+    asm volatile("dsb sy\n\t"
+                 "ic iallu\n\t"
+                 "dsb sy\n\t"
+                 "isb" : : : "memory");
+}
+#endif
+
 // Load the embedded kernel ELF at a firmware-chosen physical base. Returns the
 // physical entry point and reports the ELF image's physical base (the address
 // of the lowest-vaddr PT_LOAD segment, i.e. where the ELF header lands) in
@@ -346,6 +372,11 @@ uint64_t load_kernel(uint64_t *kernel_phys_base)
             memset(reinterpret_cast<void *>(dst + ph->p_filesz), 0,
                     ph->p_memsz - ph->p_filesz);
     }
+
+#if defined(__aarch64__)
+    // Make the copy visible to the MMU-off kernel entry (see the helper).
+    clean_to_poc_and_invalidate_icache(base, base + pages * EFI_PAGE_SIZE);
+#endif
 
     *kernel_phys_base = base + (lowest_vaddr - vbase);
     return base + (ehdr->e_entry - vbase);
