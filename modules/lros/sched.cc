@@ -34,6 +34,7 @@ int32_t n_outstanding;          // submitted and not done, for wait_all()
 size_t mem_budget_bytes;
 size_t weights_limit_bytes;
 size_t weights_pinned_bytes;
+size_t kv_paged_bytes;
 std::atomic<size_t> kv_used_bytes{0};
 std::atomic<size_t> kv_saved_bytes{0};
 
@@ -172,6 +173,8 @@ void set_weights_charge(size_t limit, size_t pinned)
     weights_pinned_bytes = pinned;
 }
 
+void set_kv_paged_charge(size_t limit) { kv_paged_bytes = limit; }
+
 mem_state mem_status()
 {
     mem_state m;
@@ -180,6 +183,7 @@ mem_state mem_status()
     m.weights_pinned = weights_pinned_bytes;
     m.kv_used        = kv_used_bytes.load(std::memory_order_relaxed);
     m.kv_saved       = kv_saved_bytes.load(std::memory_order_relaxed);
+    m.kv_paged       = kv_paged_bytes;
     return m;
 }
 

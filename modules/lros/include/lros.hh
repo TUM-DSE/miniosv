@@ -132,13 +132,15 @@ struct mem_state {
     size_t weights_pinned = 0;  // of which this much is never reclaimable
     size_t kv_used = 0;         // contexts that exist now
     size_t kv_saved = 0;        // serialised KV of contexts that were given back
+    size_t kv_paged = 0;        // the KV page cache's allowance, when KV is paged
 
-    // What the contexts may hold: the budget less the weights' allowance and
-    // less what evicted contexts are still keeping.
+    // What the contexts may hold: the budget less the weights' allowance,
+    // less the KV cache's own allowance when the KV is paged, and less what
+    // evicted contexts are still keeping.
     size_t kv_budget() const
     {
         if (budget == 0) { return SIZE_MAX; }
-        const size_t taken = weights_limit + kv_saved;
+        const size_t taken = weights_limit + kv_saved + kv_paged;
         return budget > taken ? budget - taken : 0;
     }
     bool over() const { return budget != 0 && kv_used > kv_budget(); }
@@ -152,6 +154,14 @@ void set_mem_budget(size_t bytes);
 // Told to the OS by whoever made the mapping, since the page cache's limit is
 // settled before any task exists.
 void set_weights_charge(size_t limit, size_t pinned);
+
+// What the KV page cache was allowed, when the KV caches are paged rather
+// than held whole (app/llama.cpp/miniosv/kvpage.hpp). Charged like the
+// weights' allowance and for the same reason: the cache is entitled to grow
+// to it, and a context's KV then costs the machine nothing beyond it, because
+// its pages come and go against that one figure. A task's charge is its
+// compute buffers alone, and a context need never be evicted to free KV.
+void set_kv_paged_charge(size_t limit);
 
 mem_state mem_status();
 

@@ -905,7 +905,7 @@ void *map(store &s, const policy &p, size_t limit)
     c->p = &p;
     c->store_bytes = bytes;
     c->policy_bytes = align_up(size_t(p.bytes_per_buffer), sizeof(void *));
-    c->limit = limit;
+    c->limit.store(limit, std::memory_order_relaxed);
     c->r.ops = &cache_ops;
     c->r.perm = perm_rw;
 
@@ -1048,6 +1048,31 @@ int64_t sync(void *addr, size_t bytes)
     }
     stale.invalidate();
     return total;
+}
+
+size_t held(void *addr)
+{
+    cache *c = cache_of(vspace::lookup(reinterpret_cast<uintptr_t>(addr)));
+    return c ? c->resident_bytes.load(std::memory_order_relaxed) : 0;
+}
+
+size_t limit(void *addr)
+{
+    cache *c = cache_of(vspace::lookup(reinterpret_cast<uintptr_t>(addr)));
+    return c ? c->limit.load(std::memory_order_relaxed) : 0;
+}
+
+bool set_limit(void *addr, size_t bytes)
+{
+    cache *c = cache_of(vspace::lookup(reinterpret_cast<uintptr_t>(addr)));
+    if (!c) {
+        return false;
+    }
+    c->limit.store(bytes, std::memory_order_relaxed);
+    // Come down to it now rather than at the next fault: whoever lowered the
+    // limit did so because the memory is wanted elsewhere.
+    make_room(*c, 0);
+    return true;
 }
 
 bool resident(void *addr)

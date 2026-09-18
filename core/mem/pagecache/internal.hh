@@ -76,7 +76,7 @@ struct cache {
     void *state;
     uint64_t store_bytes;
     size_t policy_bytes;
-    size_t limit;               // memory it may hold, or 0 for whatever there is
+    std::atomic<size_t> limit;  // memory it may hold, or 0 for whatever there is
     std::atomic<size_t> resident_bytes;
     std::atomic<cache *> next;
 

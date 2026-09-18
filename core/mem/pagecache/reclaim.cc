@@ -102,12 +102,16 @@ void make_room(cache &c, size_t bytes)
     if (frames::under_pressure()) {
         manager_pass(pass_bytes);
     }
-    while (c.limit) {
-        size_t held = c.resident_bytes.load(std::memory_order_relaxed);
-        if (held + bytes <= c.limit) {
+    for (;;) {
+        const size_t limit = c.limit.load(std::memory_order_relaxed);
+        if (!limit) {
             break;
         }
-        if (evict_bytes(c, held + bytes - c.limit)) {
+        size_t held = c.resident_bytes.load(std::memory_order_relaxed);
+        if (held + bytes <= limit) {
+            break;
+        }
+        if (evict_bytes(c, held + bytes - limit)) {
             continue;
         }
         
