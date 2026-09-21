@@ -14,6 +14,7 @@ import argparse
 import os
 import errno
 import shutil
+import signal
 import tempfile
 
 devnull = open('/dev/null', 'w')
@@ -237,6 +238,13 @@ def main(options):
     if options.hypervisor not in ("tcg", "kvm"):
         sys.exit("Unrecognized hypervisor '%s' (expected kvm or tcg)."
                  % options.hypervisor)
+    # A harness that gives up on a run sends SIGTERM (timeout(1), kill). The
+    # default disposition would end this process without unwinding, leaving
+    # the 128 MiB firmware copy behind in the temp dir (a tmpfs on some hosts)
+    # and the qemu child to whoever else signals it. Turning it into an
+    # exception lets subprocess kill qemu and the finally clause remove the
+    # temp dir.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(128 + signal.SIGTERM))
     start_osv_qemu(options)
 
 if __name__ == "__main__":
