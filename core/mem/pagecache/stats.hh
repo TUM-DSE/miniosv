@@ -23,6 +23,7 @@ struct counters {
     std::atomic<uint64_t> room_ticks{0};       // eviction, inside the claim
     std::atomic<uint64_t> spin_ticks{0};       // waiting for another cpu's load
     std::atomic<uint64_t> adopt_ticks{0};      // finishing a prefetch someone parked
+    std::atomic<uint64_t> prefetch_ticks{0};   // starting the look-ahead reads, inside the fault
 
     std::atomic<uint64_t> faults{0};           // calls that had to bring something in
     std::atomic<uint64_t> hits{0};             // calls that found it already there

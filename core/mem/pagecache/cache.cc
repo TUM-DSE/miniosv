@@ -833,7 +833,10 @@ bool fault_in(cache &c, uint64_t off)
 
         // Submitted before this fault waits for its own read, so the device
         // has the whole batch queued rather than one transfer at a time.
-        prefetch_start(c, *b);
+        {
+            PAGECACHE_PHASE(prefetch_ticks);
+            prefetch_start(c, *b);
+        }
         PAGECACHE_PHASE(wait_ticks);
         return load_finish(c, b);
     }
