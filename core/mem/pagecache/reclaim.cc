@@ -18,7 +18,7 @@ namespace pagecache {
 namespace {
 
 // Victims one call to the policy may name, and what one pass asks for.
-constexpr unsigned victims_max = 64;
+constexpr unsigned victims_max = 512;
 constexpr size_t pass_bytes = 16ul << 20;
 
 frames::pressure_watcher pressure;

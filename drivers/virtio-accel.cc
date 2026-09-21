@@ -108,20 +108,22 @@ accel::accel(virtio_device &dev)
 
     _queue = get_virt_queue(0);
 
+    // Pinned where the driver is set up, like every other thread: nothing
+    // moves a thread between cpus here.
+    _completer = sched::thread::make([this] { complete_loop(); },
+                                     sched::thread::attr().name("virtio-accel")
+                                         .pin(sched::cpu::current()));
+
     interrupt_factory int_factory;
     int_factory.register_msi_bindings = [this](interrupt_manager &msi) {
-        // No bottom-half thread: the caller waits for its own request, so the
-        // ISR wakes it directly rather than handing off to a worker.
         msi.easy_register({{0, [this] {
                                 this->_queue->disable_interrupts();
-                                auto *w = this->_waiter.load(std::memory_order_acquire);
-                                if (w) {
-                                    w->wake_with_irq_disabled();
-                                }
+                                this->_completer->wake_with_irq_disabled();
                             },
                             nullptr}});
     };
     _dev.register_interrupt(int_factory);
+    _completer->start();
 
     add_dev_status(VIRTIO_CONFIG_S_DRIVER_OK);
 
@@ -236,40 +238,38 @@ int accel::request(uint32_t op_type, uint32_t sess_id,
     hdr->op.in = in_args;
     *status = ACCEL_S_ERR;
 
+    pending p;
+    p.caller = sched::thread::current();
     WITH_LOCK(_lock) {
-        _queue->init_sg();
+        for (;;) {
+            _queue->init_sg();
 
-        _queue->add_out_sg(hdr, sizeof(*hdr));
-        if (out_nr) {
-            _queue->add_out_sg(out_args, out_nr * sizeof(accel_wire_arg));
-        }
-        if (in_nr) {
-            _queue->add_out_sg(in_args, in_nr * sizeof(accel_wire_arg));
-        }
-        for (uint32_t i = 0; i < out_nr; i++) {
-            _queue->add_out_sg(out_data[i], out[i].len);
-        }
-        for (uint32_t i = 0; i < in_nr; i++) {
-            _queue->add_in_sg(in_data[i], in[i].len);
-        }
-        if (want_sess_id) {
-            _queue->add_in_sg(sid, sizeof(*sid));
-        }
-        _queue->add_in_sg(status, sizeof(*status));
+            _queue->add_out_sg(hdr, sizeof(*hdr));
+            if (out_nr) {
+                _queue->add_out_sg(out_args, out_nr * sizeof(accel_wire_arg));
+            }
+            if (in_nr) {
+                _queue->add_out_sg(in_args, in_nr * sizeof(accel_wire_arg));
+            }
+            for (uint32_t i = 0; i < out_nr; i++) {
+                _queue->add_out_sg(out_data[i], out[i].len);
+            }
+            for (uint32_t i = 0; i < in_nr; i++) {
+                _queue->add_in_sg(in_data[i], in[i].len);
+            }
+            if (want_sess_id) {
+                _queue->add_in_sg(sid, sizeof(*sid));
+            }
+            _queue->add_in_sg(status, sizeof(*status));
 
-        if (!_queue->add_buf(hdr)) {
-            return -ENOSPC;
+            if (_queue->add_buf(&p)) {
+                break;
+            }
+            _room.wait(_lock);   // the ring is full of other requests
         }
-        _waiter.store(sched::thread::current(), std::memory_order_release);
         _queue->kick();
-
-        wait_for_queue(_queue, &vring::used_ring_not_empty);
-        _waiter.store(nullptr, std::memory_order_release);
-
-        u32 len = 0;
-        _queue->get_buf_elem(&len);
-        _queue->get_buf_finalize();
     }
+    sched::thread::wait_until([&p] { return p.done.load(std::memory_order_acquire); });
 
     if (*status != ACCEL_S_OK) {
         printf("virtio-accel: op %d failed with status %d\n", (int)op_type,
@@ -285,6 +285,24 @@ int accel::request(uint32_t op_type, uint32_t sess_id,
         *sess_id_out = static_cast<uint32_t>(*sid);
     }
     return 0;
+}
+
+void accel::complete_loop()
+{
+    for (;;) {
+        wait_for_queue(_queue, &vring::used_ring_not_empty);
+        WITH_LOCK(_lock) {
+            u32 len = 0;
+            while (auto *p = static_cast<pending *>(_queue->get_buf_elem(&len))) {
+                _queue->get_buf_finalize();
+                // The entry lives on the caller's stack and is gone as soon as
+                // the caller sees it done, so the thread is read first.
+                sched::thread *caller = p->caller;
+                caller->wake_with([p] { p->done.store(true, std::memory_order_release); });
+            }
+            _room.wake_all(_lock);
+        }
+    }
 }
 
 void accel::handle_irq()

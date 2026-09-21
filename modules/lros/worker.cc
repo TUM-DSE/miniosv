@@ -10,8 +10,6 @@
 
 #include <osv/sched.hh>
 
-#include <chrono>
-
 #include "include/lros.hh"
 #include "internal.hh"
 
@@ -57,17 +55,20 @@ void honour_kv_eviction(task *t)
     kv_saved_add(saved);
 }
 
-// A paused task waits here until the scheduler gives it cores again.
+// A paused task waits here until the scheduler gives it cores again, giving
+// its context back in the meantime if asked to.
 void wait_for_cores(task *t)
 {
     while (true) {
         honour_kv_eviction(t);
         WITH_LOCK(lock) {
+            while (!t->next.cpus && !t->kv_evict_asked) {
+                decided.wait(lock);
+            }
             if (t->next.cpus) {
                 return;
             }
         }
-        sched::thread::sleep(std::chrono::milliseconds(1));
     }
 }
 
@@ -77,8 +78,14 @@ void main_loop(task *t)
         honour_kv_eviction(t);
 
         assignment a;
+        uint32_t rt = 0;
         WITH_LOCK(lock) {
             a = take_assignment(t);
+            rt = t->rt_prio;
+        }
+        sched::thread *self = sched::thread::current();
+        if (self->realtime_priority() != rt) {
+            self->set_realtime_priority(rt);
         }
         if (a.cpus == 0) {
             wait_for_cores(t);
@@ -125,6 +132,7 @@ void worker_start(task *t)
     const uint64_t t0 = now_ns();
     auto *th = sched::thread::make([t] { main_loop(t); },
                                    sched::thread::attr().pin(home).detached());
+    th->set_realtime_priority(t->rt_prio);
     th->start();
     wstats.n_created++;
     wstats.create_ns_total += now_ns() - t0;
@@ -179,6 +187,7 @@ void run_parallel(cpu_mask cpus, int32_t n, void (*fn)(void *, int32_t, int32_t)
         helper_arg *ha = &args[i];
         auto *th = sched::thread::make([ha] { ha->fn(ha->arg, ha->worker, ha->n); },
                                        sched::thread::attr().pin(cpu_of_bit(bit)));
+        th->set_realtime_priority(self->realtime_priority());   // the caller's task's
         th->start();
         helpers.push_back(th);
     }
@@ -194,11 +203,13 @@ void run_parallel(cpu_mask cpus, int32_t n, void (*fn)(void *, int32_t, int32_t)
     }
     wstats.join_ns_total += now_ns() - t1;
 
-    // Give the caller back the placement it had.
+    // Give the caller back the placement it had, core included: nothing moves
+    // an unpinned thread off the core it was borrowed onto.
+    if (self_prev_cpu != home) {
+        sched::thread::pin(self_prev_cpu);
+    }
     if (!self_was_pinned) {
         self->unpin();
-    } else if (self_prev_cpu != home) {
-        sched::thread::pin(self_prev_cpu);
     }
 }
 
