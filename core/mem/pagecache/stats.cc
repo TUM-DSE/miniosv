@@ -54,6 +54,7 @@ void stats_reset()
 {
     stats.fault_ticks = 0; stats.claim_ticks = 0; stats.wait_ticks = 0;
     stats.room_ticks = 0;  stats.spin_ticks = 0;  stats.adopt_ticks = 0;
+    stats.prefetch_ticks = 0;
     stats.faults = 0; stats.hits = 0; stats.bytes_in = 0; stats.spins = 0;
     stats.evicted = 0; stats.evicted_bytes = 0;
     stats.prefetched = 0; stats.adopted = 0; stats.completed = 0;
@@ -92,6 +93,9 @@ void stats_dump()
     line("  wait for the device", stats.wait_ticks.load(), tpus, total);
     line("  install a prefetch", stats.adopt_ticks.load(), tpus, total);
     line("  spin for another cpu", stats.spin_ticks.load(), tpus, total);
+    // The look-ahead is claimed and submitted by the faulting cpu, between
+    // its own claim and its wait; the make room above counts its evictions too.
+    line("  start the prefetches", stats.prefetch_ticks.load(), tpus, total);
     printf("\n");
 }
 
