@@ -291,10 +291,13 @@ namespace nvme
         }
         else if (num_of_pages > 2)
         {
-            // Allocate PRP list as the request is larger than 8K
-            // For now we can only accomodate datasize <= 2MB so single page
-            // should be exactly enough to map up to 512 pages of the request data
-            assert(num_of_pages / 512 == 0);
+            // Allocate PRP list as the request is larger than 8K.
+            // A single list page holds 512 entries and prp1 covers the first
+            // page itself, so one list maps a request of up to 512 pages
+            // (2 MiB when page-aligned) without chaining. Beyond that the
+            // last entry would have to point at a second list, which this
+            // driver does not build.
+            assert(num_of_pages <= 512);
             u64 *prp_list = nullptr;
             _free_prp_lists.pop(prp_list);
             if (!prp_list)
