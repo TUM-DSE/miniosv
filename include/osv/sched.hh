@@ -218,6 +218,7 @@ public:
         virtual void timer_fired() = 0;
         void suspend_timers();
         void resume_timers();
+        void resume_timers(timer_list& timers);
     private:
         bool _timers_need_reload = false;
         client_list_t _active_timers;
@@ -228,6 +229,10 @@ public:
     ~timer_base();
     void set(osv::clock::uptime::time_point time);
     void set_with_irq_disabled(osv::clock::uptime::time_point time);
+    // On a given cpu's list rather than the current one's: while a thread
+    // pins itself, cpu::current() is already the target but the scheduler
+    // still runs, and arms its preemption timer, on the source.
+    void set_with_irq_disabled(timer_list& timers, osv::clock::uptime::time_point time);
     void reset(osv::clock::uptime::time_point time);
     // Set a timer using absolute wall-clock time.
     // CAVEAT EMPTOR: Internally timers are kept using the monotonic (uptime)
@@ -254,6 +259,7 @@ public:
     }
     bool expired() const;
     void cancel();
+    void cancel(timer_list& timers);
     friend bool operator<(const timer_base& t1, const timer_base& t2);
 private:
     void expire();

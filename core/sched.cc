@@ -286,7 +286,7 @@ void cpu::reschedule_from_interrupt(bool called_from_yield,
         // The current thread is still runnable. Check if it still has the
         // lowest runtime, and update the timer until the next thread's turn.
         if (runqueue.empty()) {
-            preemption_timer.cancel();
+            preemption_timer.cancel(timers);
 #ifdef __aarch64__
             return switch_data;
 #else
@@ -304,10 +304,10 @@ void cpu::reschedule_from_interrupt(bool called_from_yield,
 #endif
                 }
             } else if (t._realtime._priority == 0 && p->_runtime.get_local() < t._runtime.get_local()) {
-                preemption_timer.cancel();
+                preemption_timer.cancel(timers);
                 auto delta = p->_runtime.time_until(t._runtime.get_local());
                 if (delta > 0) {
-                    preemption_timer.set_with_irq_disabled(now + delta);
+                    preemption_timer.set_with_irq_disabled(timers, now + delta);
                 }
 #ifdef __aarch64__
                 return switch_data;
@@ -379,18 +379,18 @@ void cpu::reschedule_from_interrupt(bool called_from_yield,
             && p != idle_thread) {
         n->_runtime.add_context_switch_penalty();
     }
-    preemption_timer.cancel();
+    preemption_timer.cancel(timers);
     if (n->_realtime._priority == 0) {
         if (!called_from_yield) {
             if (!runqueue.empty()) {
                 auto& t = *runqueue.begin();
                 auto delta = n->_runtime.time_until(t._runtime.get_local());
                 if (delta > 0) {
-                    preemption_timer.set_with_irq_disabled(now + delta);
+                    preemption_timer.set_with_irq_disabled(timers, now + delta);
                 }
             }
         } else {
-            preemption_timer.set_with_irq_disabled(now + preempt_after);
+            preemption_timer.set_with_irq_disabled(timers, now + preempt_after);
         }
     }
 
@@ -547,7 +547,7 @@ void cpu::handle_incoming_wakeups()
                     // perform renormalizations which we missed while sleeping.
                     t._runtime.update_after_sleep();
                     enqueue(t);
-                    t.resume_timers();
+                    t.resume_timers(timers);
                 }
             }
         }
@@ -1426,11 +1426,16 @@ void timer_base::client::suspend_timers()
 
 void timer_base::client::resume_timers()
 {
+    resume_timers(cpu::current()->timers);
+}
+
+void timer_base::client::resume_timers(timer_list& timers)
+{
     if (!_timers_need_reload) {
         return;
     }
     _timers_need_reload = false;
-    cpu::current()->timers.resume(_active_timers);
+    timers.resume(_active_timers);
 }
 
 void thread::join()
@@ -1574,9 +1579,11 @@ void timer_list::fired()
 void timer_list::rearm()
 {
     auto t = _list.get_next_timeout();
-    if (t < _last) {
+    auto now = osv::clock::uptime::now();
+    // A deadline in the past whose interrupt never came is not programmed.
+    if (t < _last || _last <= now) {
         _last = t;
-        clock_event->set(t - osv::clock::uptime::now());
+        clock_event->set(t - now);
     }
 }
 
@@ -1635,6 +1642,11 @@ void timer_base::expire()
 
 void timer_base::set_with_irq_disabled(osv::clock::uptime::time_point time)
 {
+    set_with_irq_disabled(cpu::current()->timers, time);
+}
+
+void timer_base::set_with_irq_disabled(timer_list& timers, osv::clock::uptime::time_point time)
+{
 #if CONF_lazy_stack_invariant
     assert(!arch::irq_enabled());
 #endif
@@ -1642,7 +1654,6 @@ void timer_base::set_with_irq_disabled(osv::clock::uptime::time_point time)
     _state = state::armed;
     _time = time;
 
-    auto& timers = cpu::current()->timers;
     _t._active_timers.push_back(*this);
     if (timers._list.insert(*this)) {
         timers.rearm();
@@ -1674,6 +1685,11 @@ void timer_base::set(osv::clock::uptime::time_point time)
 
 void timer_base::cancel()
 {
+    cancel(cpu::current()->timers);
+}
+
+void timer_base::cancel(timer_list& timers)
+{
     if (_state == state::free) {
         return;
     }
@@ -1682,7 +1698,7 @@ void timer_base::cancel()
     WITH_LOCK(irq_lock) {
         if (_state == state::armed) {
             _t._active_timers.erase(_t._active_timers.iterator_to(*this));
-            cpu::current()->timers._list.remove(*this);
+            timers._list.remove(*this);
         }
         _state = state::free;
     }

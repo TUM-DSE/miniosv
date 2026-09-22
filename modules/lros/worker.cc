@@ -8,6 +8,7 @@
  * inside run_on_workers(): created for the call, pinned, joined at its end.
  */
 
+#include <osv/kernel_config.h>
 #include <osv/sched.hh>
 
 #include "include/lros.hh"
@@ -23,6 +24,11 @@ worker_stats wstats;
 // that a compute library called from inside it lands on the task's cores
 // without the engine having to thread the assignment through.
 __thread task *tls_current_task;
+
+// Workers run the engine's whole iteration, which on an accelerator's path
+// goes deeper than a kernel thread's default stack allows: the size an
+// application thread gets.
+constexpr size_t worker_stack = CONF_threads_default_pthread_stack_size;
 
 sched::cpu *cpu_of_bit(cpu_mask bit)
 {
@@ -131,7 +137,7 @@ void worker_start(task *t)
     sched::cpu *home = cpu_of_bit(t->current.cpus & -t->current.cpus);
     const uint64_t t0 = now_ns();
     auto *th = sched::thread::make([t] { main_loop(t); },
-                                   sched::thread::attr().pin(home).detached());
+                                   sched::thread::attr().pin(home).detached().stack(worker_stack));
     th->set_realtime_priority(t->rt_prio);
     th->start();
     wstats.n_created++;
@@ -186,7 +192,7 @@ void run_parallel(cpu_mask cpus, int32_t n, void (*fn)(void *, int32_t, int32_t)
         args[i] = { fn, arg, i, n };
         helper_arg *ha = &args[i];
         auto *th = sched::thread::make([ha] { ha->fn(ha->arg, ha->worker, ha->n); },
-                                       sched::thread::attr().pin(cpu_of_bit(bit)));
+                                       sched::thread::attr().pin(cpu_of_bit(bit)).stack(worker_stack));
         th->set_realtime_priority(self->realtime_priority());   // the caller's task's
         th->start();
         helpers.push_back(th);

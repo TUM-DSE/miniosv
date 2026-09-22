@@ -46,6 +46,9 @@ accel *accel::_instance = nullptr;
 
 namespace {
 
+// Above every real-time priority an lros worker or arrival thread takes.
+constexpr unsigned completer_rt_priority = 200;
+
 // Every descriptor starts here, so keep them apart by the widest alignment the
 // structures need. The device reads the argument arrays as packed structs.
 const size_t ARG_ALIGN = 16;
@@ -123,6 +126,9 @@ accel::accel(virtio_device &dev)
                             nullptr}});
     };
     _dev.register_interrupt(int_factory);
+    // Above any thread that waits on it: a waiter's siblings may spin on this
+    // cpu at a real-time priority until the reply comes.
+    _completer->set_realtime_priority(completer_rt_priority);
     _completer->start();
 
     add_dev_status(VIRTIO_CONFIG_S_DRIVER_OK);
