@@ -11,6 +11,8 @@
 #include <osv/kernel_config.h>
 #include <osv/sched.hh>
 
+#include <string>
+
 #include "include/lros.hh"
 #include "internal.hh"
 
@@ -108,6 +110,7 @@ void main_loop(task *t)
         const iter_result r = ops.iterate(*t, a);
         tls_current_task = nullptr;
         t->n_iterations++;
+        iterations_done.fetch_add(1, std::memory_order_relaxed);
 
         switch (r) {
         case iter_result::running:
@@ -136,8 +139,10 @@ void worker_start(task *t)
 {
     sched::cpu *home = cpu_of_bit(t->current.cpus & -t->current.cpus);
     const uint64_t t0 = now_ns();
+    // Named after the task, so that a dump of the threads reads as tasks.
     auto *th = sched::thread::make([t] { main_loop(t); },
-                                   sched::thread::attr().pin(home).detached().stack(worker_stack));
+                                   sched::thread::attr().pin(home).detached().stack(worker_stack)
+                                       .name("lros:t" + std::to_string(t->id)));
     th->set_realtime_priority(t->rt_prio);
     th->start();
     wstats.n_created++;
@@ -191,8 +196,10 @@ void run_parallel(cpu_mask cpus, int32_t n, void (*fn)(void *, int32_t, int32_t)
         rest &= ~bit;
         args[i] = { fn, arg, i, n };
         helper_arg *ha = &args[i];
+        const std::string name = "lros:" + (tls_current_task ? "t" + std::to_string(tls_current_task->id) : std::string("x"))
+                                 + "h" + std::to_string(i);
         auto *th = sched::thread::make([ha] { ha->fn(ha->arg, ha->worker, ha->n); },
-                                       sched::thread::attr().pin(cpu_of_bit(bit)).stack(worker_stack));
+                                       sched::thread::attr().pin(cpu_of_bit(bit)).stack(worker_stack).name(name));
         th->set_realtime_priority(self->realtime_priority());   // the caller's task's
         th->start();
         helpers.push_back(th);

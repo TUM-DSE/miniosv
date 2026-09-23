@@ -344,6 +344,22 @@ struct task_stats {
 };
 size_t finished_tasks(task_stats *out, size_t max);
 
+// Prints every task (state, cores, priority, iterations) and every lros
+// thread (core, status, real-time priority) to the console: what a watchdog
+// calls when nothing has completed for a while.
+void dump_tasks();
+
+// A real-time thread above every worker that dumps the tasks when no
+// iteration has completed for `stall_seconds`, once per stall. Above the
+// workers so that it runs even when they spin on every core.
+void watchdog_start(uint32_t stall_seconds);
+
+// Gives the calling core up for a few microseconds. What a compute
+// library's spin-wait calls now and then, so that a worker spinning at a
+// real-time priority cannot hold its core against a lower-priority thread
+// its peers are waiting for.
+void yield_briefly();
+
 // Worker lifecycle cost, accumulated: create+pin+start, and join.
 struct worker_stats {
     uint64_t n_created;

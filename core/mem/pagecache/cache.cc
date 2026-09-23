@@ -771,6 +771,20 @@ bool fault_in(cache &c, uint64_t off)
     uintptr_t va = va_of(c, align_down(off, uint64_t(page_size)));
     bool counted = false;
     unsigned trips = 0;
+    // Waiting for another thread's claim: a spin at first, since the read
+    // usually lands within a millisecond, then short sleeps. The claimant
+    // may have been descheduled on this very core by a thread of higher
+    // priority -- the one faulting here -- and a pure spin would then wait
+    // for a thread that can never run.
+    unsigned waited = 0;
+    auto wait_a_little = [&]() {
+        spin.tick();
+        if (++waited > 32) {
+            sched::thread::sleep(std::chrono::microseconds(20));
+        } else {
+            processor::spin_hint();
+        }
+    };
     for (;;) {
         auto s = mapping::find(va);
         if (s) {
@@ -791,8 +805,7 @@ bool fault_in(cache &c, uint64_t off)
                     continue;
                 }
             }
-            spin.tick();
-            processor::spin_hint();
+            wait_a_little();
             continue;
         }
         spin.stop();
@@ -810,8 +823,7 @@ bool fault_in(cache &c, uint64_t off)
         case load_result::started:
             break;
         case load_result::taken:
-            spin.tick();
-            processor::spin_hint();
+            wait_a_little();
             continue;
         case load_result::failed:
             PAGECACHE_COUNT(nomem, 1);
