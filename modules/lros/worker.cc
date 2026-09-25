@@ -82,6 +82,15 @@ void wait_for_cores(task *t)
 
 void main_loop(task *t)
 {
+    int32_t last_width = -1;   // cores of the last iteration, for the engine's log
+    auto note_width = [&](int32_t n) {
+        if (n != last_width) {
+            last_width = n;
+            if (ops.width_changed) {
+                ops.width_changed(*t, n);
+            }
+        }
+    };
     while (true) {
         honour_kv_eviction(t);
 
@@ -96,9 +105,11 @@ void main_loop(task *t)
             self->set_realtime_priority(rt);
         }
         if (a.cpus == 0) {
+            note_width(0);
             wait_for_cores(t);
             continue;
         }
+        note_width(a.n_cpus());
 
         // The main worker runs on the lowest core of the assignment.
         sched::cpu *home = cpu_of_bit(a.cpus & -a.cpus);
@@ -120,6 +131,7 @@ void main_loop(task *t)
             continue;
         case iter_result::done:
         case iter_result::failed:
+            note_width(0);
             task_done(t);     // frees t
             core_freed();
             return;

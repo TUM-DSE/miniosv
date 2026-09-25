@@ -238,6 +238,12 @@ struct engine_ops {
     // 0..n-1 through run_on_workers(). Must update t.ph on a phase change.
     iter_result (*iterate)(task &t, const assignment &a);
 
+    // Optional: the number of cores a task computes on changed -- before an
+    // iteration whose assignment differs from the last, 0 when it pauses,
+    // and 0 when it is done. For the engine's log; the scheduler keeps no
+    // record of its assignments over time.
+    void (*width_changed)(const task &t, int32_t n_cpus) = nullptr;
+
     // A member finished; the engine releases its state.
     void (*finished)(task &t, request *r);
 
