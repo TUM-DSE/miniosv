@@ -170,7 +170,7 @@ conf_drivers_virtio=1
 conf_drivers_virtio_accel=1
 
 # --- accelerator offload ---------------------------------------------------
-conf_vaccel=1
+conf_vaccel=0
 conf_lros=1
 
 # miniext talks to the NVMe driver directly, so it cannot be built without it.
