@@ -157,8 +157,13 @@ conf_pagecache_stats=0
 # --- network ---------------------------------------------------------------
 # mininet is a minimal HTTP client stack the application calls directly
 # (modules/mininet/mininet.hh). There is no socket layer. It drives the ENA
-# NIC itself, so it needs conf_drivers_ena. Apps link it via mininet.mk.
+# NIC itself, so it needs conf_drivers_ena, and like the driver it is x64
+# only: the crate is built for the host. Apps link it via mininet.mk.
+ifeq ($(arch),x64)
 conf_net_mininet=1
+else
+conf_net_mininet=0
+endif
 
 # --- threads / stacks ------------------------------------------------------
 conf_threads_default_kernel_stack_size=65536
@@ -168,8 +173,12 @@ conf_interrupt_stack_size=0x1000
 # --- device drivers --------------------------------------------------------
 conf_drivers_acpi=1
 conf_drivers_pci=1
-# On: modules/mininet drives it. CONF_drivers_ena in include/osv/drivers_config.h must be set too.
+# The ENA NIC, which modules/mininet drives. x64 only: it sits on x64 MSI-X.
+ifeq ($(arch),x64)
 conf_drivers_ena=1
+else
+conf_drivers_ena=0
+endif
 conf_drivers_nvme=1
 # vAccel needs virtio transport drivers (bus, vring, PCI).
 conf_drivers_virtio=1
@@ -372,6 +381,12 @@ $(out)/libc/%.o: source-dialects =
 # do not hide symbols in libc because it has its own hiding mechanism
 
 kernel-defines = -D_KERNEL $(source-dialects) \
+	-DCONF_drivers_acpi=$(conf_drivers_acpi) \
+	-DCONF_drivers_pci=$(conf_drivers_pci) \
+	-DCONF_drivers_ena=$(conf_drivers_ena) \
+	-DCONF_drivers_nvme=$(conf_drivers_nvme) \
+	-DCONF_drivers_virtio=$(conf_drivers_virtio) \
+	-DCONF_drivers_virtio_accel=$(conf_drivers_virtio_accel) \
 	-DCONF_fs_miniext=$(conf_fs_miniext) \
 	-DCONF_memory_histogram=$(conf_memory_histogram) \
 	-DCONF_net_mininet=$(conf_net_mininet) \
@@ -1067,8 +1082,8 @@ perhaps-modify-version-h:
 	$(call quiet, sh scripts/gen-version-header $(out)/gen/include/osv/version.h, GEN gen/include/osv/version.h)
 .PHONY: perhaps-modify-version-h
 
-# The CONF_drivers_* macros used by source code (e.g. arch-setup.cc) are frozen
-# in the checked-in include/osv/drivers_config.h; nothing is generated here.
+# The CONF_drivers_* macros reach the code through kernel-defines above;
+# include/osv/drivers_config.h only holds defaults for a compile outside make.
 
 $(out)/gen/include/bits/alltypes.h: include/api/$(arch)/bits/alltypes.h.sh
 	$(makedir)
