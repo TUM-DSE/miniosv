@@ -1,5 +1,9 @@
 # modules/mininet: $(mininet-objects) for a Rust app that has the crate, $(mininet-lib-objects) for everyone else.
 
+ifneq ($(conf_net_mininet),1)
+$(error this app needs conf_net_mininet=1)
+endif
+
 mininet-dir := modules/mininet
 
 $(out)/$(mininet-dir)/shim/shim.o: CXXFLAGS += -Iinclude/api/minidpdk

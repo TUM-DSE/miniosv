@@ -154,6 +154,12 @@ conf_fs_miniext=1
 conf_nvme_max_queue_depth=16
 conf_pagecache_stats=0
 
+# --- network ---------------------------------------------------------------
+# mininet is a minimal HTTP client stack the application calls directly
+# (modules/mininet/mininet.hh). There is no socket layer. It drives the ENA
+# NIC itself, so it needs conf_drivers_ena. Apps link it via mininet.mk.
+conf_net_mininet=1
+
 # --- threads / stacks ------------------------------------------------------
 conf_threads_default_kernel_stack_size=65536
 conf_threads_default_pthread_stack_size=0x100000
@@ -178,6 +184,12 @@ conf_lros=1
 ifeq ($(conf_fs_miniext),1)
 ifneq ($(conf_drivers_nvme),1)
 $(error conf_fs_miniext=1 needs conf_drivers_nvme=1)
+endif
+endif
+
+ifeq ($(conf_net_mininet),1)
+ifneq ($(conf_drivers_ena),1)
+$(error conf_net_mininet=1 needs conf_drivers_ena=1)
 endif
 endif
 
@@ -362,6 +374,7 @@ $(out)/libc/%.o: source-dialects =
 kernel-defines = -D_KERNEL $(source-dialects) \
 	-DCONF_fs_miniext=$(conf_fs_miniext) \
 	-DCONF_memory_histogram=$(conf_memory_histogram) \
+	-DCONF_net_mininet=$(conf_net_mininet) \
 	-DCONF_nvme_max_queue_depth=$(conf_nvme_max_queue_depth) \
 	-DCONF_pagecache_stats=$(conf_pagecache_stats)
 

@@ -17,7 +17,7 @@
 #   - os-stress    : concurrency / allocator / TLS stress tests
 #   - os-miniext   : miniext filesystem checks, only when conf_fs_miniext=1
 #                    (needs --emulated-nvme at run time; skips without)
-#   - os-mininet   : network stack unit tests, no NIC needed.
+#   - os-mininet   : network stack unit tests, no NIC needed; only when conf_net_mininet=1
 
 app-objects =  test/osv_tests.o
 app-objects += test/os-features.o
@@ -28,10 +28,12 @@ app-objects += test/os-memory.o
 app-objects += test/os-memory-primitives.o
 app-objects += test/os-stress.o
 
+ifeq ($(conf_net_mininet),1)
 mininet-features := selftest
 include modules/mininet/mininet.mk
 app-objects += test/os-mininet.o
 app-objects += $(mininet-lib-objects)
+endif
 ifeq ($(conf_fs_miniext),1)
 app-objects += test/os-miniext.o
 endif
