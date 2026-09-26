@@ -572,16 +572,14 @@ void cpu::handle_incoming_wakeups()
                     // of sched::thread::pin(thread*, cpu*). Do nothing.
                 } else if (cpu *alt = forward_to(t)) {
                     // This cpu is busy and another idles: the thread would
-                    // wait out a slice here. The same steps the load balancer
-                    // used, on the cpu whose timer list holds the thread.
+                    // wait out a slice here. Done on the cpu whose timer list
+                    // holds the thread, the only place that can.
                     trace_sched_migrate(&t, alt->id);
                     t.stat_migrations.incr();
                     t.suspend_timers();
                     // The thread may have slept across this cpu's
                     // renormalization: bring its local runtime up to date
-                    // first, as the enqueue branch below does. The balancer
-                    // never needed this -- it moved queued threads, which
-                    // renormalize() walks -- and exporting a stale value
+                    // first, as the enqueue branch below does: a stale value
                     // overflowed the destination's rescale to infinity, which
                     // ties with the idle thread and trips n!=p at reschedule.
                     t._runtime.update_after_sleep();
@@ -718,9 +716,8 @@ void thread::pin(cpu *target_cpu)
     }
     // We want to wake this thread on the target CPU, but can't do this while
     // it is still running on this CPU. So we need a different thread to
-    // complete the wakeup. We could re-used an existing thread (e.g., the
-    // load balancer thread) but a "good-enough" dirty solution is to
-    // temporarily create a new ad-hoc thread, "wakeme".
+    // complete the wakeup. A "good-enough" dirty solution is to temporarily
+    // create a new ad-hoc thread, "wakeme".
     bool do_wakeme = false;
     thread_unique_ptr wakeme(thread::make_unique([&] () {
         wait_until([&] { return do_wakeme; });
@@ -761,8 +758,7 @@ void thread::pin(thread *t, cpu *target_cpu)
     }
     // To work on the target thread, we need to run code on the same CPU on
     // where the target thread is currently running. We start here a new
-    // helper thread to follow the target thread's CPU. We could have also
-    // re-used an existing thread (e.g., the load balancer thread).
+    // helper thread to follow the target thread's CPU.
     thread_unique_ptr helper(thread::make_unique([&] {
 #if CONF_lazy_stack_invariant
         assert(!thread::current()->is_app());

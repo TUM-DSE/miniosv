@@ -831,8 +831,8 @@ private:
     // is true, it was permanently incremented by 1 by sched::thread::pin().
     // In the future, we should replace this boolean _pinned by a bitmask
     // of allowed cpus for this thread (for full support of
-    // sched_setaffinity()), and the load balancer should consult this bitmask
-    // to decide to which cpus a thread may migrate.
+    // sched_setaffinity()), which placement and wakeup forwarding would
+    // consult to decide to which cpus a thread may go.
     bool _pinned;
     arch_thread _arch;
     unsigned int _id;
