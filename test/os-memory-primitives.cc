@@ -2302,6 +2302,30 @@ void mapping_pending_invalidation()
         stale.invalidate();
         CHECK(stale.count == 0);
     }
+
+    test("concurrent invalidates share flushes");
+    {
+        const unsigned threads = std::min<unsigned>(8, sched::cpus.size());
+        if (threads < 2) {
+            printf("\t  skipped: one cpu\n");
+        } else {
+            auto asked = map::flushes_asked.load();
+            auto merged = map::flushes_coalesced.load();
+            std::atomic<unsigned> bad{0};
+            parallel(threads, [&](unsigned) {
+                scratch s(4 * page);
+                for (int i = 0; i < 200; i++) {
+                    if (!map::populate(s.range(0, 4 * page), mem::perm_rw)) {
+                        bad++;
+                    }
+                    map::depopulate(s.range(0, 4 * page));
+                }
+            });
+            CHECK(bad == 0);
+            CHECK(map::flushes_asked.load() - asked >= threads * 200);
+            CHECK(map::flushes_coalesced.load() > merged);
+        }
+    }
 }
 
 void mapping_pte_ref()

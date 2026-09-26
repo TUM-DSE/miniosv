@@ -137,6 +137,8 @@ void flush_all();
 uint64_t flush_epoch();
 // Whether one that began after "epoch" was taken has finished.
 bool flushed_since(uint64_t epoch);
+// Full flushes asked for, and how many a newer one had already covered.
+extern std::atomic<uint64_t> flushes_asked, flushes_coalesced;
 
 // Make entries the caller wrote itself visible to the page-table walker.
 inline void barrier() { pte_barrier(); }
