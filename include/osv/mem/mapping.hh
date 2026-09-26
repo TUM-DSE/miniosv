@@ -134,8 +134,10 @@ void flush_local(range r);
 void flush_range(range r);
 void flush_all();
 
-// Counts completed global invalidations. The currency of detach_deferred().
+// Counts global invalidations begun. The currency of detach_deferred().
 uint64_t flush_epoch();
+// Whether one that began after "epoch" was taken has finished.
+bool flushed_since(uint64_t epoch);
 
 // Make entries the caller wrote itself visible to the page-table walker.
 inline void barrier() { pte_barrier(); }

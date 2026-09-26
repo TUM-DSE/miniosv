@@ -2170,13 +2170,14 @@ void mapping_flush_epoch()
         auto e0 = map::flush_epoch();
         scratch s(4 * page);
         CHECK(map::populate(s.range(0, 4 * page), mem::perm_rw));
-        map::protect(s.range(0, 4 * page), mem::perm_read);
         map::flush_local(s.range(0, 4 * page));
         map::flush_range(s.range(0, 4 * page));
-        map::depopulate(s.range(0, 4 * page));
         CHECK(map::flush_epoch() == e0);
-        map::flush_all();
+        CHECK(!map::flushed_since(e0));
+        map::protect(s.range(0, 4 * page), mem::perm_read); // takes a right away: a global flush
         CHECK(map::flush_epoch() > e0);
+        CHECK(map::flushed_since(e0));
+        map::depopulate(s.range(0, 4 * page));
     }
 
     test("barrier makes an entry written by hand usable");

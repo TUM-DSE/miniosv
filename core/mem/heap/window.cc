@@ -86,8 +86,7 @@ void dirty_push(uint32_t i)
 // Skip slots no TLB can be holding any more.
 void harvest()
 {
-    uint64_t now = mapping::flush_epoch();
-    while (dirty_head != no_page && now >= pages[dirty_head].epoch + 2) {
+    while (dirty_head != no_page && mapping::flushed_since(pages[dirty_head].epoch)) {
         uint32_t i = pop(dirty_head);
         if (dirty_head == no_page) {
             dirty_tail = no_page;

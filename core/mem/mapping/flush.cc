@@ -39,8 +39,8 @@ void flush_local(range r)
     }
 }
 
-// Naming each address in turn, on every cpu.
-// Does not move the epoch.
+// Naming each address in turn, on every cpu. Past flush_batch pages it is a
+// full flush instead, and only then does the epoch move.
 void flush_range(range r)
 {
     size_t pages = align_up(r.size(), page_size) / page_size;
@@ -61,6 +61,14 @@ void flush_all()
     begun.fetch_add(1, std::memory_order_seq_cst);
     tlb_flush_all();
     done.fetch_add(1, std::memory_order_seq_cst);
+}
+
+bool flushed_since(uint64_t epoch)
+{
+    // More flushes have finished than had started when the epoch was taken,
+    // so one of them started after. Flushes overlap, which is why finishing
+    // later is not enough on its own.
+    return done.load(std::memory_order_seq_cst) > epoch;
 }
 
 void pending_invalidation::add(uintptr_t addr)
@@ -86,7 +94,7 @@ static void flush_all_since(uint64_t epoch)
 {
     flushes_asked.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard<mutex> guard(coalesce_mutex);
-    if (done.load(std::memory_order_seq_cst) > epoch) {
+    if (flushed_since(epoch)) {
         flushes_coalesced.fetch_add(1, std::memory_order_relaxed);
         return;
     }
@@ -95,14 +103,10 @@ static void flush_all_since(uint64_t epoch)
 
 void pending_invalidation::invalidate()
 {
-    // More flushes have finished than had started when the entries were
-    // cleared, so one of them started after: it named these addresses already.
-    // Flushes overlap, which is why finishing later is not enough on its own.
-    //
     // Always a full flush, never the address list: the cost is the round trip
     // to every cpu, not the entries, and only a full flush can stand in for
     // the ones queued behind it.
-    if ((count || all) && done.load(std::memory_order_seq_cst) <= epoch) {
+    if ((count || all) && !flushed_since(epoch)) {
         flush_all_since(epoch);
     }
     count = 0;
