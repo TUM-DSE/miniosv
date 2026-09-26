@@ -531,7 +531,7 @@ mod loopback {
         sockets: SocketSet<'static>,
         server: SocketHandle,
         client: SocketHandle,
-        now_ms: i64,
+        pub(super) now_ms: i64,
     }
 
     impl Env {
@@ -566,6 +566,12 @@ mod loopback {
 
         pub(super) fn now_ns(&self) -> u64 {
             self.now_ms as u64 * 1_000_000
+        }
+
+        /// One step of the connection at the current time, no packets moved.
+        pub(super) fn step(&mut self, conn: &mut Conn) -> Step {
+            let now = self.now_ns();
+            conn.step(&mut self.sockets, now)
         }
 
         pub(super) fn reusable(&self, conn: &Conn) -> bool {
@@ -655,13 +661,25 @@ fn test_loopback_http(r: &mut Report) {
         r.check(!env.reusable(&conn), "a closed connection is not reused");
     }
 
-    // The server hangs up before answering; the connection's own FAIL line is expected.
+    // The server hangs up before answering.
     {
         let mut env = Env::new();
         let mut g = Guarded::new(4);
         let mut conn = env.connect(GET, Box::new(g.sink()));
         let step = env.drive(&mut conn, b"", Server::Close);
         r.check(step == Step::Failed(Error::BadResponse), "a close before any head is a failure");
+    }
+
+    // Nobody answers the SYN: the connection gives up on its own after the timeout.
+    {
+        let mut env = Env::new();
+        let mut g = Guarded::new(4);
+        let mut conn = env.connect(GET, Box::new(g.sink()));
+        env.now_ms += 4_999;
+        r.check(env.step(&mut conn) == Step::Pending, "a SYN still waits at 5 s");
+        env.now_ms += 2;
+        let step = env.step(&mut conn);
+        r.check(step == Step::Failed(Error::SynTimeout), "past it, the SYN times out");
     }
 
     // HEAD: the head announces a length, no body follows, and that is complete.

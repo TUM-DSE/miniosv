@@ -226,6 +226,7 @@ impl Conn {
             && now_ns.saturating_sub(self.connect_start_ns) > SYN_TIMEOUT_NS
         {
             s.abort();
+            #[cfg(not(feature = "selftest"))]
             println!(
                 "FAIL: q{} SYN timeout on port {} after {} ms — no SYN-ACK",
                 self.queue_id,
@@ -302,6 +303,7 @@ impl Conn {
         if self.handshake_done && self.request_queued && ended && self.outgoing.is_empty() && !s.can_recv() {
             // Closed before any head arrived is a failure, not an empty body.
             if !self.parser.headers_done() {
+                #[cfg(not(feature = "selftest"))]
                 println!(
                     "FAIL: q{} port {} closed before answering",
                     self.queue_id, self.src_port
