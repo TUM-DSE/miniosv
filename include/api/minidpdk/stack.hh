@@ -7,12 +7,12 @@
 #include <processor.hh>
 #include <vector>
 
-// Inter-CPU test-and-set spinlock. `preempt_lock` alone would only stop
-// the current CPU from being scheduled off between push and pop; when
-// two workers share the mempool from different CPUs we need real mutual
-// exclusion. The critical section is a few nanoseconds, so we spin
-// rather than sleep — a sleeping mutex here starves the tight RX/TX
-// polling loops that never voluntarily hit a scheduling point.
+// Test-and-set spinlock on the free stack. mininet gives every queue its own
+// pool and one pinned worker, so nothing contends here today and the lock is
+// one uncontended exchange per push or pop; it is what keeps a pool shared
+// across cpus, which minidpdk allows, correct. The critical section is a few
+// nanoseconds, so it spins: a sleeping mutex would starve the polling loops,
+// which never voluntarily hit a scheduling point.
 struct pool_spinlock {
   std::atomic<bool> flag{false};
   void lock() {
