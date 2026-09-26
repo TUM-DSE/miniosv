@@ -101,6 +101,15 @@ int64_t sync(void *addr, size_t bytes);
 // Check if the buffer containing this address is mapped.
 bool resident(void *addr);
 
+// Memory the cache containing this address holds, and what it is allowed.
+size_t held(void *addr);
+size_t limit(void *addr);
+
+// Change what it is allowed, reclaiming down to the new figure before
+// returning. This is how a memory manager outside the cache squeezes it:
+// lower the limit and the pages go back, at buffer granularity.
+bool set_limit(void *addr, size_t bytes);
+
 // Ensures the buffers overlapping with the range are mapped.
 size_t fetch(void *addr, size_t bytes);
 

@@ -150,9 +150,10 @@ def start_osv_qemu(options):
             dev = "nvme,serial=deadbeef%d,drive=nvm%d,bootindex=%d" % (i, i, i)
             if options.nvme_mdts is not None:
                 dev += ",mdts=%d" % options.nvme_mdts
-            args += [
-                "-drive", "file=%s,if=none,id=nvm%d,format=raw" % (image, i),
-                "-device", dev]
+            drive = "file=%s,if=none,id=nvm%d,format=raw" % (image, i)
+            if options.nvme_cache is not None:
+                drive += ",cache=%s" % options.nvme_cache
+            args += ["-drive", drive, "-device", dev]
 
         # vAccel offload: the guest reaches a host accelerator through this
         # device.
@@ -275,6 +276,12 @@ if __name__ == "__main__":
                         help="MDTS for the emulated data drives: one command "
                              "carries 4 KiB << this, so 7 is 512 KiB and 9 is "
                              "2 MiB. QEMU's own default is 7.")
+    parser.add_argument("--nvme-cache", action="store", default=None,
+                        choices=["none", "writeback", "writethrough", "directsync", "unsafe"],
+                        help="QEMU cache mode for the emulated data drives. The "
+                             "default (writeback) serves repeated reads from the "
+                             "host page cache; 'none' opens the file O_DIRECT so "
+                             "every guest read really hits the disk.")
     parser.add_argument("--vaccel", action="store_true",
                         help="attach the virtio-accel device; needs the QEMU from the "
                              "lros-qemu flake (uses $QEMU_VACCEL unless --qemu-path is given)")

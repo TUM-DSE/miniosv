@@ -37,6 +37,7 @@ uefi_entry:
         bl      zero_bss
         bl      init_cpu
         bl      fixup_boot_pt
+        bl      invalidate_boot_pt
         bl      init_boot_pt
         bl      init_mmu                   // returns operating in virtual memory
 
@@ -211,6 +212,29 @@ fixup_pt_entry:
         ldr     x1, [x0]   // x0 contains address of the entry, x6 contains offset
         sub     x1, x1, x6 // apply kernel offset
         str     x1, [x0]   // store the fixed pt entry back into memory
+        ret
+
+        /* The boot page tables were just written with the MMU off, i.e.
+         * straight to memory, bypassing the caches. Drop any copy the caches
+         * may still hold (prefetched, or a leftover of the loader's copy of
+         * the image) so the cacheable translation-table walks after init_mmu
+         * see what we wrote. Linux does the same after __create_page_tables.
+         * Invalidate, don't clean: a dirty leftover would be the unfixed
+         * content. Covers ident_pt_l4_ttbr0 .. ident_pt_l4_ttbr1 (contiguous). */
+invalidate_boot_pt:
+        adrp    x0, ident_pt_l4_ttbr0
+        adrp    x1, ident_pt_l4_ttbr1
+        add     x1, x1, #4096
+        mrs     x2, ctr_el0
+        ubfx    x2, x2, #16, #4    // DminLine: log2(words per line)
+        mov     x3, #4
+        lsl     x2, x3, x2         // line size in bytes
+        dsb     sy
+1:      dc      ivac, x0
+        add     x0, x0, x2
+        cmp     x0, x1
+        b.lo    1b
+        dsb     sy
         ret
 
 init_boot_pt:

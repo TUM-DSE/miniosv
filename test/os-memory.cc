@@ -1407,6 +1407,38 @@ void capability_limit_and_policy()
         pc::unmap(b);
     }
 
+    test("held() and limit() report the region, and lowering the limit gives memory back");
+    {
+        const size_t cap = 64 << 20;
+        pattern_store s(1ull << 30);
+        auto *b = static_cast<char *>(pc::map(s, pc::defaults(), cap));
+        CHECK(b != nullptr);
+        CHECK(pc::limit(b) == cap);
+        CHECK(pc::held(b) == 0);
+
+        for (uint64_t off = 0; off < 4 * uint64_t(cap); off += page) {
+            (void) peek64(b + off);
+        }
+        const size_t full = pc::held(b);
+        CHECK(full > cap / 2);
+        CHECK(full <= cap);
+
+        // The squeeze a memory manager outside the cache does: the pages are
+        // back before set_limit returns, and reading them again works.
+        CHECK(pc::set_limit(b, cap / 4));
+        CHECK(pc::limit(b) == cap / 4);
+        CHECK(pc::held(b) <= cap / 4);
+        CHECK(matches(b, 0, 1 << 20));
+        printf("\t  %zu MiB held, squeezed to %zu MiB\n",
+               full >> 20, pc::held(b) >> 20);
+
+        // Off the map it answers nothing rather than guessing.
+        CHECK(pc::held(nullptr) == 0);
+        CHECK(pc::limit(nullptr) == 0);
+        CHECK(!pc::set_limit(nullptr, cap));
+        pc::unmap(b);
+    }
+
     test("a working set larger than the limit is served, and served correctly");
     {
         const size_t limit = 256 << 20;
@@ -1462,7 +1494,7 @@ void capability_limit_and_policy()
         CHECK(g_spy.helpers_ok.load());
         CHECK(g_spy.faults.load() >= int(bytes / ragged_span) / 2);
         CHECK(g_spy.evicted.load() > 0);
-        CHECK(g_spy.victims_max.load() == 64);
+        CHECK(g_spy.victims_max.load() == 512); // reclaim.cc's victims_max
         // Touched buffers read as accessed by the time they are evicted.
         CHECK(g_spy.accessed_at_evict.load() > 0);
         pc::unmap(b);

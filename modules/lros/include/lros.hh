@@ -6,7 +6,8 @@
  * phase change, a core freed) and hands each task an assignment: the cores it
  * may use from its next iteration on. A task runs iteration after iteration
  * on its assignment until it finishes or the assignment changes, so a change
- * takes effect at an iteration boundary and never inside one.
+ * takes effect at an iteration boundary, unless set_preempt_in_iteration()
+ * lets a better priority take cores inside one.
  *
  * The engine supplies the policies (how to batch, how many cores a phase
  * wants) and the mechanism of one iteration; the OS supplies the queue, the
@@ -102,6 +103,8 @@ struct task {
     // Preemption accounting. A decision changes `next`; the task applies it
     // at its next iteration boundary, so the delay between the two is what
     // preemption actually costs, and it is bounded by one iteration.
+    bool     on_device;          // blocked in an accelerator submission
+    uint32_t rt_prio;            // real-time priority of its workers, 0 for none
     uint64_t t_decided;          // when `next` last changed, 0 if applied
     uint64_t decision_lag_ns;    // summed decision -> boundary
     uint64_t paused_ns;          // summed time held at zero cores
@@ -132,13 +135,15 @@ struct mem_state {
     size_t weights_pinned = 0;  // of which this much is never reclaimable
     size_t kv_used = 0;         // contexts that exist now
     size_t kv_saved = 0;        // serialised KV of contexts that were given back
+    size_t kv_paged = 0;        // the KV page cache's allowance, when KV is paged
 
-    // What the contexts may hold: the budget less the weights' allowance and
-    // less what evicted contexts are still keeping.
+    // What the contexts may hold: the budget less the weights' allowance,
+    // less the KV cache's own allowance when the KV is paged, and less what
+    // evicted contexts are still keeping.
     size_t kv_budget() const
     {
         if (budget == 0) { return SIZE_MAX; }
-        const size_t taken = weights_limit + kv_saved;
+        const size_t taken = weights_limit + kv_saved + kv_paged;
         return budget > taken ? budget - taken : 0;
     }
     bool over() const { return budget != 0 && kv_used > kv_budget(); }
@@ -152,6 +157,14 @@ void set_mem_budget(size_t bytes);
 // Told to the OS by whoever made the mapping, since the page cache's limit is
 // settled before any task exists.
 void set_weights_charge(size_t limit, size_t pinned);
+
+// What the KV page cache was allowed, when the KV caches are paged rather
+// than held whole (app/llama.cpp/miniosv/kvpage.hpp). Charged like the
+// weights' allowance and for the same reason: the cache is entitled to grow
+// to it, and a context's KV then costs the machine nothing beyond it, because
+// its pages come and go against that one figure. A task's charge is its
+// compute buffers alone, and a context need never be evicted to free KV.
+void set_kv_paged_charge(size_t limit);
 
 mem_state mem_status();
 
@@ -254,6 +267,13 @@ void set_cores(cpu_mask usable);
 void set_accel_capacity(int32_t n_units);
 int32_t accel_capacity();
 
+// Off (the default): a core another task runs on is handed over at that
+// task's next iteration boundary. On: a task takes cores from a worse-priority
+// one at once. Its workers run there at a real-time priority, so the kernel
+// stops the other task's threads where they are, mid-iteration, and they carry
+// on when the cores are free again.
+void set_preempt_in_iteration(bool on);
+
 // Arrival: called on whatever core the caller runs on. Queues the request as
 // a task and takes a scheduling decision. Returns the task id.
 int32_t submit(request *r);
@@ -286,6 +306,12 @@ void run_workers_here(int32_t n, void (*fn)(void *arg, int32_t worker, int32_t n
 
 // The task this thread is running an iteration of, or nullptr.
 task *current_task();
+
+// Around a blocking accelerator submission from inside iterate(). While the
+// calling task waits on the device its cores are not counted as busy, so
+// another task may be started on them; no-ops outside a task.
+void device_enter();
+void device_leave();
 
 // What a task's inference context costs, told by the engine when it makes one
 // and when it gives it back. Charged against the KV share of the budget.

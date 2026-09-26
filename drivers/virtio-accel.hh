@@ -22,6 +22,7 @@
 
 #include <osv/mutex.h>
 #include <osv/sched.hh>
+#include <osv/waitqueue.hh>
 
 #include "drivers/device.hh"
 #include "drivers/virtio.hh"
@@ -127,22 +128,28 @@ private:
                 const arg *in, uint32_t in_nr,
                 uint32_t *sess_id_out);
 
+    // Takes finished requests off the used ring and wakes their callers.
+    void complete_loop();
+
     static accel *_instance;
 
     vring *_queue;
 
-    // The thread parked in wait_for_queue(), for the completion handler to
-    // wake. There is no worker thread here: the caller waits for its own
-    // request, so the interrupt has to hand control back to it directly.
-    // Serialised by _lock, so there is at most one.
-    std::atomic<sched::thread *> _waiter{nullptr};
+    // Several requests may be in flight, so that a graph submitted by one task
+    // does not hold back another's: the host can then run them in priority
+    // order. Each caller waits on its own entry; the completion thread matches
+    // used-ring cookies to entries.
+    struct pending {
+        sched::thread *caller;
+        std::atomic<bool> done{false};
+    };
+    sched::thread *_completer = nullptr;
 
-    // Requests are serialised. The device has a single virtqueue and every
-    // caller waits for its own completion, so allowing several in flight would
-    // mean matching used-ring cookies to waiters for no gain: an accelerator
-    // offload is one big operation, not a stream of small ones. Revisit if a
-    // workload ever overlaps them.
+    // The ring. Held only while descriptors are added or taken back, never
+    // across a request.
     mutex _lock;
+    // Woken, under _lock, when descriptors are given back.
+    waitqueue _room;
 };
 
 }

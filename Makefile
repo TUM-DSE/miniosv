@@ -89,7 +89,7 @@ else
 $(error unsupported architecture $(arch))
 endif
 
-CROSS_PREFIX ?= $(if $(filter-out $(arch),$(host_arch)),$(arch)-linux-gnu-)
+CROSS_PREFIX ?= $(if $(filter-out $(arch),$(host_arch)),$(ARCH_STR)-linux-gnu-)
 # Pure-LLVM toolchain: one clang/clang++ that cross-compiles by target triple
 # (no per-arch GNU gcc). When building for a non-host arch, point clang at the
 # target with --target=<triple> derived from CROSS_PREFIX (strip trailing '-').
@@ -185,7 +185,7 @@ conf_drivers_virtio=1
 conf_drivers_virtio_accel=1
 
 # --- accelerator offload ---------------------------------------------------
-conf_vaccel=1
+conf_vaccel=0
 conf_lros=1
 
 # miniext talks to the NVMe driver directly, so it cannot be built without it.
