@@ -136,6 +136,8 @@ void release(uint32_t i)
 }
 
 
+}
+
 // Give back up to "count" of the pages being held, and say whether any were.
 bool release_some(uint32_t count)
 {
@@ -155,11 +157,9 @@ bool release_some(uint32_t count)
     return n != 0;
 }
 
-bool under_pressure()
+static bool under_pressure()
 {
     return release_some(release_batch);
-}
-
 }
 
 void init()

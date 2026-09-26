@@ -32,6 +32,8 @@
 #include <osv/mem/vspace.hh>
 #include <osv/mutex.h>
 
+#include "core/mem/heap/internal.hh"
+
 #include "mem-test.hh"
 
 extern "C" void *reallocarray(void *ptr, size_t nmemb, size_t size);
@@ -582,6 +584,29 @@ void heap_pressure()
         }
         CHECK(fr::free_bytes() + (16ul << 20) >= before);
         printf("\t  held %zu MiB, one round gave %zu MiB\n", held >> 20, gave >> 20);
+    }
+
+    test("a released page's address waits for a global flush");
+    {
+        // Everything held released, then one flush empties the quarantine.
+        while (fr::reclaim(fr::total_available_bytes())) {
+        }
+        map::flush_all();
+        uint32_t a = mem::heap::page_get();
+        CHECK(a != mem::heap::no_page);
+        mem::heap::page_put(a);
+        auto e = map::flush_epoch();
+        CHECK(mem::heap::release_some(1));
+        // Not before a flush that began after the release has finished.
+        uint32_t b = mem::heap::page_get();
+        if (!map::flushed_since(e)) {
+            CHECK(b != a);
+        }
+        map::flush_all();
+        uint32_t c = mem::heap::page_get();
+        CHECK(c == a);
+        mem::heap::page_put(b);
+        mem::heap::page_put(c);
     }
 
     test("an allocation that would fail is served from what the heap holds");
