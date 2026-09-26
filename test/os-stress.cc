@@ -32,6 +32,9 @@
 #include <pthread.h>
 #include <sys/mman.h>
 #include <time.h>
+#include <algorithm>
+
+#include <osv/sched.hh>
 
 static std::atomic<int> g_checks{0};
 static std::atomic<int> g_fails{0};
@@ -271,6 +274,48 @@ static void test_time_sched()
     CHECK(errors.load() == 0);
 }
 
+/* A burst of threads spreads over the cpus, and a reserved cpu gets none of them. */
+static void test_sched_placement()
+{
+    section("sched: placement spreads a burst, and skips a reserved cpu");
+    const unsigned n = sched::cpus.size();
+    if (n < 2) { CHECK(true); return; }
+
+    auto burst = [n](std::vector<unsigned> &where) {
+        std::mutex m;
+        std::atomic<unsigned> started{0};
+        std::atomic<bool> go{false};
+        std::vector<std::thread> ts;
+        for (unsigned i = 0; i < 4 * n; i++)
+            ts.emplace_back([&] {
+                unsigned c = sched::cpu::current()->id;
+                { std::lock_guard<std::mutex> g(m); where.push_back(c); }
+                started++;
+                while (!go.load()) sched_yield();   /* stay runnable, so load counts */
+            });
+        while (started.load() < 4 * n) sched_yield();
+        go = true;
+        for (auto &t : ts) t.join();
+    };
+    auto distinct = [](std::vector<unsigned> w) {
+        std::sort(w.begin(), w.end());
+        return std::unique(w.begin(), w.end()) - w.begin();
+    };
+
+    std::vector<unsigned> where;
+    burst(where);
+    CHECK(distinct(where) >= 2);
+
+    CHECK(sched::reserve_cpu(n - 1));
+    CHECK(sched::reserve_cpu(n - 1));                       /* again is fine */
+    where.clear();
+    burst(where);
+    CHECK(std::count(where.begin(), where.end(), n - 1) == 0);
+
+    for (unsigned c = 1; c + 1 < n; c++) CHECK(sched::reserve_cpu(c));
+    CHECK(!sched::reserve_cpu(0));                          /* the last free cpu stays free */
+}
+
 int os_stress_main()
 {
     printf("==== OSv OS-interaction stress tests ====\n");
@@ -287,6 +332,7 @@ int os_stress_main()
     test_mmap_concurrent();
 
     test_time_sched();
+    test_sched_placement();
 
     printf("\n==== os-stress: %d checks, %d failures ====\n",
            g_checks.load(), g_fails.load());
