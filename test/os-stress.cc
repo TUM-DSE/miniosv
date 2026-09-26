@@ -210,7 +210,7 @@ static void test_mmap_anon()
     for (size_t i = 0; i < SZ; i += 4096) if (m[i] != 0xA5) ok = false;
     CHECK(ok);
     CHECK(mprotect(p, SZ, PROT_READ) == 0);          /* make read-only */
-    CHECK(madvise(p, SZ, MADV_DONTNEED) == 0 || errno == EINVAL);
+    CHECK(madvise(p, SZ, MADV_DONTNEED) == 0);
     CHECK(munmap(p, SZ) == 0);
 }
 
