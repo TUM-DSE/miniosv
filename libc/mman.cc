@@ -235,11 +235,9 @@ int msync(void *addr, size_t length, int flags)
     return 0;
 }
 
-// Nothing is given back: the frames under a mapping belong to it until it is
-// unmapped. MADV_DONTNEED is accepted and does nothing.
-OSV_LIBC_API
 // DONTNEED and FREE drop whole leaves and zero the rest, so the range reads
 // as zero afterwards either way, which is what jemalloc's purge assumes.
+OSV_LIBC_API
 int madvise(void *addr, size_t length, int advice)
 {
     auto *r = anon_at(addr);
