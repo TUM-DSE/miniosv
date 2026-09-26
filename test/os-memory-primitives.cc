@@ -1818,7 +1818,7 @@ void mapping_detach_deferred()
 {
     function("mapping::detach_deferred");
 
-    test("clears the entries, records the addresses, and flushes nothing");
+    test("clears the entries, counts them, and flushes nothing");
     {
         scratch s(4 * page);
         auto f = fr::alloc(4 * page);
@@ -1828,8 +1828,6 @@ void mapping_detach_deferred()
         map::pending_invalidation stale;
         map::detach_deferred(s.range(0, 2 * page), stale);
         CHECK(stale.count == 2);
-        CHECK(stale.va[0] == s.start());
-        CHECK(stale.va[1] == s.start() + page);
         CHECK(!stale.all);
         CHECK(stale.epoch == before);
         CHECK(!map::find(s.start()));
@@ -1839,7 +1837,6 @@ void mapping_detach_deferred()
         // A second call adds to the same list.
         map::detach_deferred(s.range(2 * page, 2 * page), stale);
         CHECK(stale.count == 4);
-        CHECK(stale.va[3] == s.start() + 3 * page);
         stale.invalidate();
         fr::free(f, 4 * page);
     }
@@ -2170,13 +2167,14 @@ void mapping_flush_epoch()
         auto e0 = map::flush_epoch();
         scratch s(4 * page);
         CHECK(map::populate(s.range(0, 4 * page), mem::perm_rw));
-        map::protect(s.range(0, 4 * page), mem::perm_read);
         map::flush_local(s.range(0, 4 * page));
         map::flush_range(s.range(0, 4 * page));
-        map::depopulate(s.range(0, 4 * page));
         CHECK(map::flush_epoch() == e0);
-        map::flush_all();
+        CHECK(!map::flushed_since(e0));
+        map::protect(s.range(0, 4 * page), mem::perm_read); // takes a right away: a global flush
         CHECK(map::flush_epoch() > e0);
+        CHECK(map::flushed_since(e0));
+        map::depopulate(s.range(0, 4 * page));
     }
 
     test("barrier makes an entry written by hand usable");
@@ -2261,7 +2259,6 @@ void mapping_bits()
         map::clear_dirty(v, stale);
         if (map::tracks_writes) {
             CHECK(stale.count == 1);
-            CHECK(stale.va[0] == s.start());
             CHECK(stale.epoch != map::never_flushed);
             CHECK(!map::dirty(v));
         }
@@ -2275,7 +2272,7 @@ void mapping_pending_invalidation()
 {
     function("mapping::pending_invalidation");
 
-    test("add records up to flush_batch addresses, then says all");
+    test("add counts up to flush_batch entries, then says all");
     {
         map::pending_invalidation stale;
         CHECK(stale.count == 0);
@@ -2286,7 +2283,6 @@ void mapping_pending_invalidation()
         }
         CHECK(stale.count == map::flush_batch);
         CHECK(!stale.all);
-        CHECK(stale.va[map::flush_batch - 1] == 0x1000 * map::flush_batch);
         stale.add(0x1000 * (map::flush_batch + 1));
         CHECK(stale.count == map::flush_batch);
         CHECK(stale.all);
@@ -2305,6 +2301,30 @@ void mapping_pending_invalidation()
         CHECK(stale.epoch == map::never_flushed);
         stale.invalidate();
         CHECK(stale.count == 0);
+    }
+
+    test("concurrent invalidates share flushes");
+    {
+        const unsigned threads = std::min<unsigned>(8, sched::cpus.size());
+        if (threads < 2) {
+            printf("\t  skipped: one cpu\n");
+        } else {
+            auto asked = map::flushes_asked.load();
+            auto merged = map::flushes_coalesced.load();
+            std::atomic<unsigned> bad{0};
+            parallel(threads, [&](unsigned) {
+                scratch s(4 * page);
+                for (int i = 0; i < 200; i++) {
+                    if (!map::populate(s.range(0, 4 * page), mem::perm_rw)) {
+                        bad++;
+                    }
+                    map::depopulate(s.range(0, 4 * page));
+                }
+            });
+            CHECK(bad == 0);
+            CHECK(map::flushes_asked.load() - asked >= threads * 200);
+            CHECK(map::flushes_coalesced.load() > merged);
+        }
     }
 }
 

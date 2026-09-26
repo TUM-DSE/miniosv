@@ -23,6 +23,9 @@
 #ifndef CONF_fs_miniext
 #define CONF_fs_miniext 1
 #endif
+#ifndef CONF_net_mininet
+#define CONF_net_mininet 1
+#endif
 #ifndef CONF_interrupt_stack_size
 #define CONF_interrupt_stack_size 0x1000
 #endif

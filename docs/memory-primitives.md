@@ -166,31 +166,35 @@ The flushes the functions above issue, for a caller that wrote entries itself.
 | `void flush_local(range r)` | Flushes `r` on this cpu. |
 | `void flush_range(range r)` | Flushes `r` on every cpu. |
 | `void flush_all()` | Flushes everything on every cpu and advances the epoch. |
-| `uint64_t flush_epoch()` | Completed global flushes so far. |
+| `uint64_t flush_epoch()` | Global flushes begun so far. |
+| `bool flushed_since(uint64_t epoch)` | Whether a global flush that began after `epoch` was taken has finished. |
 | `void barrier()` | Makes entries the caller wrote visible to the page-table walker. Needed after writing through a `pte_ref`. |
 
 ### Deferred invalidation
 
 Clearing an entry leaves stale copies in the TLBs. `pending_invalidation`
-collects cleared addresses to flush them in one go.
+counts cleared entries so they are flushed in one go, or not at all.
 
 ```cpp
 struct pending_invalidation {
-    uintptr_t va[flush_batch]; 
     unsigned count;
-    bool all; // list is full
+    bool all; // past flush_batch
     uint64_t epoch; // when the TLB entries became stale
     void add(uintptr_t addr);
     void invalidate();
 };
 ```
 
-`add()` records an address, or sets `all` if past `flush_batch`.
+`add()` counts an entry, or sets `all` past `flush_batch`.
 
-`invalidate()` ensures that the virtual memory do not have stale TLB entries in any core.
-This can happen in two cases:
-1. `invalidate()` actually flushes them on every cpu using an IPI (expensive).
-2. a global flush of the TLBs on all cores happened after `epoch`, in which case the entries are already gone and it does nothing. *Note*: the current epoch (available via `flush_epoch()`) must be strictly superior to `epoch`+1 to avoid TLB invalidation.
+`invalidate()` makes sure no cpu still holds the cleared entries, one of two ways:
+1. `flushed_since(epoch)` already holds: more flushes have finished than had
+   begun when the entries were cleared, so one of them began after and covered
+   them. Nothing to do.
+2. Otherwise it asks for a full flush of every cpu, never by address: the cost
+   is the round trip, and only a full flush can stand in for the ones queued
+   behind it. Callers are serialized, and one that finds a newer flush finished
+   by the time it holds the lock does nothing either.
 
 
 ### Accessed and dirty bits

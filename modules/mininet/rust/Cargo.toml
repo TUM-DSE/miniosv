@@ -1,0 +1,47 @@
+[package]
+name = "mininet"
+version = "0.1.0"
+edition = "2021"
+
+# staticlib for C++ callers, rlib for Rust ones.
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
+[dependencies.smoltcp]
+version = "0.13.1"
+default-features = false
+features = [
+    "medium-ethernet",
+    "proto-ipv4",
+    "proto-dhcpv4",
+    "socket-tcp",
+    "socket-dhcpv4",
+]
+
+[features]
+default = []
+rustcrypto = ["dep:rustls-rustcrypto"]
+# The pure-logic tests behind mininet_selftest(); `make app=test` turns it on.
+selftest = ["smoltcp/alloc"]  # the loopback device
+
+# rustls no_std, TLS 1.3 only; ring is the provider.
+[dependencies.rustls]
+version = "0.23"
+default-features = false
+features = ["ring"]
+
+# Pure-Rust fallback provider: ~6x slower AES-GCM than ring (GHASH-bound).
+[dependencies.rustls-rustcrypto]
+version = "0.0.2-alpha"
+default-features = false
+features = ["alloc"]
+optional = true
+
+[dependencies.webpki-roots]
+version = "0.26"

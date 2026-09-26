@@ -29,6 +29,9 @@ int os_iostream_main();
 int os_memmove_main();
 int os_memory_main();
 int os_memory_primitives_main();
+#if CONF_net_mininet
+int os_mininet_main();
+#endif
 #if CONF_fs_miniext
 int os_miniext_main();
 #endif
@@ -50,6 +53,9 @@ const suite suites[] = {
 	{"memmove",  os_memmove_main,  "memmove() overlap correctness"},
 	{"memory",   os_memory_main,   "the memory clients: early, heap, page cache"},
 	{"memory-primitives", os_memory_primitives_main, "the memory primitives: vspace, frames, mapping"},
+#if CONF_net_mininet
+	{"mininet",  os_mininet_main,  "network stack: parser, body sink, ABI (no NIC needed)"},
+#endif
 #if CONF_fs_miniext
 	{"miniext",  os_miniext_main,  "miniext filesystem (needs --emulated-nvme)"},
 #endif

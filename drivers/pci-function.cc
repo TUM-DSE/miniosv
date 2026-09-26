@@ -31,10 +31,10 @@ namespace pci {
     {
     }
 
-    void bar::map()
+    void bar::map(mem::mattr ma)
     {
         if (_is_mmio) {
-            _addr_mmio = mmio_map(get_addr64(), get_size(), "pci_bar");
+            _addr_mmio = mmio_map(get_addr64(), get_size(), "pci_bar", ma);
         }
     }
 

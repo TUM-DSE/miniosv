@@ -1343,7 +1343,9 @@ static int ena_set_queues_placement_policy(
   /* Nothing to config, exit */
   if (ena_dev->tx_mem_queue_type == ENA_ADMIN_PLACEMENT_POLICY_HOST)
     return 0;
-  adapter->dev_mem->map();
+  // The LLQ BAR takes each frame's 128-byte entry as a burst of stores;
+  // write-combined they leave as one transaction, uncached as sixteen.
+  adapter->dev_mem->map(mem::mattr::wc);
   ena_dev->mem_bar = const_cast<void *>(adapter->dev_mem->get_mmio());
 
   return 0;
@@ -2436,9 +2438,10 @@ int ena_attach(pci::device *dev, ena_adapter **_adapter) {
 
   /* Assign default devargs values */
   adapter->missing_tx_completion_to = ENA_TX_TIMEOUT;
-  // LLQ is ENA's TX fast path: the descriptor + inline header is
-  // written to the device via a single MMIO burst into the LLQ BAR,
-  // rather than a descriptor+DMA round-trip. Cuts per-TX-packet CPU.
+  // LLQ is ENA's TX fast path: the descriptor and inline header go straight
+  // into the device BAR, mapped write-combining (ena_device_init). Uncached
+  // that cost ~3.5 us a frame; host-memory queues instead (2026-09-17) made
+  // the device's completion rate the ceiling, ~25 Gbps on 8 and 16 queues.
   adapter->llq_header_policy = ENA_LLQ_POLICY_RECOMMENDED;
 
   rc = ena_com_allocate_customer_metrics_buffer(ena_dev);

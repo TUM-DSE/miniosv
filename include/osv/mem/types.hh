@@ -48,10 +48,14 @@ enum {
 };
 
 // How the hardware may reorder, cache and combine accesses to a mapping.
-// Only aarch64 distinguishes the two.
+// aarch64 distinguishes normal from dev. x64 adds wc, write-combining, for a
+// device BAR that is written in bursts and never read back (ENA's LLQ): the
+// hypervisor leaves such a BAR uncached, which makes every store a serialised
+// transaction unless the guest asks for combining itself.
 enum class mattr {
     normal,
     dev,
+    wc,
 };
 
 }

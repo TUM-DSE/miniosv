@@ -32,6 +32,8 @@
 #include <osv/mem/vspace.hh>
 #include <osv/mutex.h>
 
+#include "core/mem/heap/internal.hh"
+
 #include "mem-test.hh"
 
 extern "C" void *reallocarray(void *ptr, size_t nmemb, size_t size);
@@ -582,6 +584,29 @@ void heap_pressure()
         }
         CHECK(fr::free_bytes() + (16ul << 20) >= before);
         printf("\t  held %zu MiB, one round gave %zu MiB\n", held >> 20, gave >> 20);
+    }
+
+    test("a released page's address waits for a global flush");
+    {
+        // Everything held released, then one flush empties the quarantine.
+        while (fr::reclaim(fr::total_available_bytes())) {
+        }
+        map::flush_all();
+        uint32_t a = mem::heap::page_get();
+        CHECK(a != mem::heap::no_page);
+        mem::heap::page_put(a);
+        auto e = map::flush_epoch();
+        CHECK(mem::heap::release_some(1));
+        // Not before a flush that began after the release has finished.
+        uint32_t b = mem::heap::page_get();
+        if (!map::flushed_since(e)) {
+            CHECK(b != a);
+        }
+        map::flush_all();
+        uint32_t c = mem::heap::page_get();
+        CHECK(c == a);
+        mem::heap::page_put(b);
+        mem::heap::page_put(c);
     }
 
     test("an allocation that would fail is served from what the heap holds");
@@ -1469,7 +1494,7 @@ void capability_limit_and_policy()
         CHECK(g_spy.helpers_ok.load());
         CHECK(g_spy.faults.load() >= int(bytes / ragged_span) / 2);
         CHECK(g_spy.evicted.load() > 0);
-        CHECK(g_spy.victims_max.load() == 64);
+        CHECK(g_spy.victims_max.load() == 512); // reclaim.cc's victims_max
         // Touched buffers read as accessed by the time they are evicted.
         CHECK(g_spy.accessed_at_evict.load() > 0);
         pc::unmap(b);
@@ -1881,12 +1906,14 @@ void libc_mmap()
         }
     }
 
-    test("a mapping spends its memory at once and gives it back");
+    test("a mapping spends its memory when touched and gives it back");
     {
         const size_t size = 64ul << 20;
         size_t before = fr::free_bytes();
         char *p = static_cast<char *>(anon(size));
         CHECK(p != nullptr);
+        CHECK(before - fr::free_bytes() < size / 2);
+        memset(p, 1, size);
         CHECK(before - fr::free_bytes() >= size);
         CHECK(munmap(p, size) == 0);
         CHECK(fr::free_bytes() + (1ul << 20) >= before);
@@ -1924,16 +1951,16 @@ void libc_mmap()
         CHECK(munmap(p, size) == 0);
     }
 
-    test("MADV_DONTNEED is accepted and changes nothing");
+    test("MADV_DONTNEED gives the memory back and reads as zero");
     {
         const size_t size = 8ul << 20;
         char *p = static_cast<char *>(anon(size));
         memset(p, 9, size);
         size_t populated = fr::free_bytes();
         CHECK(madvise(p, size, MADV_DONTNEED) == 0);
-        CHECK(fr::free_bytes() == populated);
-        CHECK(p[0] == 9);
-        CHECK(p[size - 1] == 9);
+        CHECK(fr::free_bytes() >= populated + size);
+        CHECK(p[0] == 0);
+        CHECK(p[size - 1] == 0);
         CHECK(munmap(p, size) == 0);
     }
 

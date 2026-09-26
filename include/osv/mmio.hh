@@ -9,6 +9,7 @@
 #define MMIO_HH
 
 #include <osv/types.h>
+#include <osv/mem/types.hh>
 
 typedef volatile void* mmioaddr_t;
 
@@ -30,7 +31,8 @@ u32 mmio_getl(mmioaddr_t addr);
 u64 mmio_getq(mmioaddr_t addr);
 
 // Map mmio regions
-mmioaddr_t mmio_map(u64 paddr, size_t size_bytes, const char* name);
+mmioaddr_t mmio_map(u64 paddr, size_t size_bytes, const char* name,
+                    mem::mattr ma = mem::mattr::normal);
 void mmio_unmap(mmioaddr_t addr, size_t size_bytes);
 
 #endif // MMIO_HH

@@ -2,6 +2,9 @@
 .cache
 aws
 build/
+# cargo's build output for modules/mininet/rust; `build/` above only covers
+# the kernel's own, which is a different directory
+target/
 .\#*
 \#*\#
 

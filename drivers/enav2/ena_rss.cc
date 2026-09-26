@@ -5,7 +5,6 @@
  */
 
 #include "base/ena_plat.h"
-// #include "drivers/ena.hh"
 #include "ena_ethdev.h"
 #include "ena_if.h"
 #include <api/minidpdk/dev.hh>
