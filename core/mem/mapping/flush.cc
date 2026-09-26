@@ -71,13 +71,13 @@ bool flushed_since(uint64_t epoch)
     return done.load(std::memory_order_seq_cst) > epoch;
 }
 
-void pending_invalidation::add(uintptr_t addr)
+void pending_invalidation::add(uintptr_t)
 {
     if (count == flush_batch) {
         all = true;
         return;
     }
-    va[count++] = addr;
+    count++;
 }
 
 // One global flush covers every clear that came before it began, so callers

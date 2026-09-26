@@ -89,10 +89,10 @@ bool attach_missing(range r, frames::phys_addr phys, unsigned perm, size_t slop 
                     mattr ma = mattr::normal);
 
 /*
- * Virtual address that have been cleared but that may be stale in a TLB.
- * invalidate() flushes the TLB.
+ * Entries that have been cleared but may still be in a TLB: how many, up to
+ * flush_batch, or "all" past that. invalidate() flushes every cpu whole, so
+ * the addresses themselves are not kept.
  *
- * The list has flush_batch entries at max.
  * "epoch" is flush_epoch() as of the moment the last of these entries was
  * cleared; invalidate() returns directly if a global flush has begun and
  * finished since. Leaving it alone means flushing.
@@ -100,7 +100,6 @@ bool attach_missing(range r, frames::phys_addr phys, unsigned perm, size_t slop 
 constexpr uint64_t never_flushed = ~uint64_t(0);
 
 struct pending_invalidation {
-    uintptr_t va[flush_batch];
     unsigned count = 0;
     bool all = false;
     uint64_t epoch = never_flushed;

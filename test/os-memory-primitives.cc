@@ -1818,7 +1818,7 @@ void mapping_detach_deferred()
 {
     function("mapping::detach_deferred");
 
-    test("clears the entries, records the addresses, and flushes nothing");
+    test("clears the entries, counts them, and flushes nothing");
     {
         scratch s(4 * page);
         auto f = fr::alloc(4 * page);
@@ -1828,8 +1828,6 @@ void mapping_detach_deferred()
         map::pending_invalidation stale;
         map::detach_deferred(s.range(0, 2 * page), stale);
         CHECK(stale.count == 2);
-        CHECK(stale.va[0] == s.start());
-        CHECK(stale.va[1] == s.start() + page);
         CHECK(!stale.all);
         CHECK(stale.epoch == before);
         CHECK(!map::find(s.start()));
@@ -1839,7 +1837,6 @@ void mapping_detach_deferred()
         // A second call adds to the same list.
         map::detach_deferred(s.range(2 * page, 2 * page), stale);
         CHECK(stale.count == 4);
-        CHECK(stale.va[3] == s.start() + 3 * page);
         stale.invalidate();
         fr::free(f, 4 * page);
     }
@@ -2262,7 +2259,6 @@ void mapping_bits()
         map::clear_dirty(v, stale);
         if (map::tracks_writes) {
             CHECK(stale.count == 1);
-            CHECK(stale.va[0] == s.start());
             CHECK(stale.epoch != map::never_flushed);
             CHECK(!map::dirty(v));
         }
@@ -2276,7 +2272,7 @@ void mapping_pending_invalidation()
 {
     function("mapping::pending_invalidation");
 
-    test("add records up to flush_batch addresses, then says all");
+    test("add counts up to flush_batch entries, then says all");
     {
         map::pending_invalidation stale;
         CHECK(stale.count == 0);
@@ -2287,7 +2283,6 @@ void mapping_pending_invalidation()
         }
         CHECK(stale.count == map::flush_batch);
         CHECK(!stale.all);
-        CHECK(stale.va[map::flush_batch - 1] == 0x1000 * map::flush_batch);
         stale.add(0x1000 * (map::flush_batch + 1));
         CHECK(stale.count == map::flush_batch);
         CHECK(stale.all);
