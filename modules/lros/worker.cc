@@ -82,13 +82,19 @@ void wait_for_cores(task *t)
 
 void main_loop(task *t)
 {
-    int32_t last_width = -1;   // cores of the last iteration, for the engine's log
+    // The cores this task computes on, for the engine's log: reported on
+    // every change, 0 while paused and 0 at the end. The scheduler reports
+    // 0 itself when a better task takes a core mid-iteration (t->logged_width
+    // is shared with it, under the lock), and the next assignment taken here
+    // reports the resumption.
     auto note_width = [&](int32_t n) {
-        if (n != last_width) {
-            last_width = n;
-            if (ops.width_changed) {
-                ops.width_changed(*t, n);
-            }
+        bool changed = false;
+        WITH_LOCK(lock) {
+            changed = (n != t->logged_width);
+            t->logged_width = n;
+        }
+        if (changed && ops.width_changed) {
+            ops.width_changed(*t, n);
         }
     };
     while (true) {

@@ -110,6 +110,11 @@ struct task {
     uint64_t paused_ns;          // summed time held at zero cores
     uint64_t t_paused_since;     // 0 when running
     uint32_t n_preemptions;      // assignments that took every core away
+    // The cores last reported through engine_ops::width_changed: the count
+    // it computes on, 0 while paused, and 0 from the moment a better task
+    // takes one of its cores mid-iteration until it runs again. Under the
+    // lock.
+    int32_t  logged_width;
 
     // Memory. `kv_charged` is what this task's context costs while it exists;
     // the scheduler sets `kv_evict_asked` when it wants that back, and the

@@ -343,7 +343,10 @@ void schedule()
         }
     }
 
-    // A task on cores a worse priority still runs on outranks it there.
+    // A task on cores a worse priority still runs on outranks it there. The
+    // worse one stops computing from this moment -- its thread there is
+    // descheduled and its others wait at the next barrier -- so the engine
+    // hears it has no cores, until it takes its next assignment.
     for (task *t : runnable) {
         cpu_mask worse = 0;
         for (task *o : runnable) {
@@ -353,6 +356,14 @@ void schedule()
         }
         const cpu_mask mine = t->current.cpus | t->next.cpus;
         t->rt_prio = preempt_in_iteration && (mine & worse) ? rt_of(t->prio) : 0;
+        if (t->rt_prio && ops.width_changed) {
+            for (task *o : runnable) {
+                if (o->prio > t->prio && (o->current.cpus & mine) && o->logged_width != 0) {
+                    o->logged_width = 0;
+                    ops.width_changed(*o, 0);
+                }
+            }
+        }
     }
     for (task *t : started) {
         worker_start(t);
@@ -443,6 +454,7 @@ int32_t submit(request *r)
     t->t_decided = t->decision_lag_ns = 0;
     t->paused_ns = t->t_paused_since = 0;
     t->n_preemptions = 0;
+    t->logged_width = -1;
     t->on_device = false;
     t->rt_prio = 0;
     t->kv_charged = 0;
