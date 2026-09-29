@@ -547,11 +547,14 @@ namespace nvme
             }
         }
 
-        // Ring the CQ head doorbell once for the whole batch instead of on
-        // every completion: the controller only needs the latest head value,
-        // so a single MMIO write per poll replaces one write per CQE.
-        if (counter > 0)
+        // Ring the CQ head doorbell once the unacknowledged count reaches half
+        // the queue, not once per drain. The controller raises an interrupt
+        // per completion, so a drain is a single entry and this fired on every
+        // one. See _cq_unacked in the header for why holding it back is safe.
+        _cq_unacked += (u32)counter;
+        if (counter > 0 && _cq_unacked >= (u32)(_qsize / 2))
         {
+            _cq_unacked = 0;
             mmio_setl(_cq._doorbell, _cq._head);
         }
 
