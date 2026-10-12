@@ -153,6 +153,8 @@ def start_osv_qemu(options):
             drive = "file=%s,if=none,id=nvm%d,format=raw" % (image, i)
             if options.nvme_cache is not None:
                 drive += ",cache=%s" % options.nvme_cache
+            if options.nvme_aio is not None:
+                drive += ",aio=%s" % options.nvme_aio
             args += ["-drive", drive, "-device", dev]
 
         # vAccel offload: the guest reaches a host accelerator through this
@@ -276,6 +278,10 @@ if __name__ == "__main__":
                         help="MDTS for the emulated data drives: one command "
                              "carries 4 KiB << this, so 7 is 512 KiB and 9 is "
                              "2 MiB. QEMU's own default is 7.")
+    parser.add_argument("--nvme-aio", action="store", default=None,
+                        choices=["threads", "native", "io_uring"],
+                        help="QEMU aio backend for the emulated data drives; native "
+                             "and io_uring need --nvme-cache none")
     parser.add_argument("--nvme-cache", action="store", default=None,
                         choices=["none", "writeback", "writethrough", "directsync", "unsafe"],
                         help="QEMU cache mode for the emulated data drives. The "
