@@ -47,6 +47,7 @@ enum : pte {
     pte_p    = pte(1) << 0,    // present
     pte_w    = pte(1) << 1,    // writable
     pte_u    = pte(1) << 2,    // reachable from ring 3
+    pte_pwt  = pte(1) << 3,    // PAT index bit 0; entry 1 is write-combining (arch_cpu::init_on_cpu)
     pte_a    = pte(1) << 5,    // accessed
     pte_d    = pte(1) << 6,    // dirty
     pte_hp   = pte(1) << 7,    // Huge page flag
@@ -90,9 +91,13 @@ inline pte pte_make_table(frames::phys_addr p)
     return p | pte_p | pte_w | pte_u | pte_a;
 }
 
-inline pte pte_make_leaf(frames::phys_addr p, unsigned perm, unsigned level, mattr)
+inline pte pte_make_leaf(frames::phys_addr p, unsigned perm, unsigned level, mattr ma)
 {
     pte e = p | pte_u | pte_a | pte_d;
+    if (ma == mattr::wc) {
+        // PWT alone selects PAT entry 1, valid for 4K and huge leaves alike.
+        e |= pte_pwt;
+    }
     if (perm) {
         e |= pte_p;
     }

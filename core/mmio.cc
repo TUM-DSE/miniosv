@@ -50,10 +50,10 @@ u64 mmio_getq(mmioaddr_t addr)
     return (*reinterpret_cast<volatile u64*>(addr));
 }
 
-mmioaddr_t mmio_map(u64 paddr, size_t size_bytes, const char* name)
+mmioaddr_t mmio_map(u64 paddr, size_t size_bytes, const char* name, mem::mattr ma)
 {
     char* map_to = mem::linear + paddr;
-    mem::map_phys_at(map_to, paddr, size_bytes);
+    mem::map_phys_at(map_to, paddr, size_bytes, 4096, ma);
     return map_to;
 }
 

@@ -96,6 +96,8 @@ fi
 # QEMU_EFI works too.
 codecopy="$work/code.fd"; cp "$code" "$codecopy"
 varscopy="$work/vars.fd"; cp "$vars" "$varscopy"
+# Writable: a nix store path is 0444 and qemu cannot open it as pflash.
+chmod u+w "$codecopy" "$varscopy"
 if [ "$arch" = aarch64 ]; then
     truncate -s 64M "$codecopy"
     truncate -s 64M "$varscopy"

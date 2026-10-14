@@ -154,6 +154,17 @@ conf_fs_miniext=1
 conf_nvme_max_queue_depth=16
 conf_pagecache_stats=0
 
+# --- network ---------------------------------------------------------------
+# mininet is a minimal HTTP client stack the application calls directly
+# (modules/mininet/mininet.hh). There is no socket layer. It drives the ENA
+# NIC itself, so it needs conf_drivers_ena, and like the driver it is x64
+# only: the crate is built for the host. Apps link it via mininet.mk.
+ifeq ($(arch),x64)
+conf_net_mininet=1
+else
+conf_net_mininet=0
+endif
+
 # --- threads / stacks ------------------------------------------------------
 conf_threads_default_kernel_stack_size=65536
 conf_threads_default_pthread_stack_size=0x100000
@@ -162,8 +173,12 @@ conf_interrupt_stack_size=0x1000
 # --- device drivers --------------------------------------------------------
 conf_drivers_acpi=1
 conf_drivers_pci=1
-# Off until the ENA port is brought up to the current memory and PCI APIs.
+# The ENA NIC, which modules/mininet drives. x64 only: it sits on x64 MSI-X.
+ifeq ($(arch),x64)
+conf_drivers_ena=1
+else
 conf_drivers_ena=0
+endif
 conf_drivers_nvme=1
 # vAccel needs virtio transport drivers (bus, vring, PCI).
 conf_drivers_virtio=1
@@ -178,6 +193,12 @@ conf_lros=1
 ifeq ($(conf_fs_miniext),1)
 ifneq ($(conf_drivers_nvme),1)
 $(error conf_fs_miniext=1 needs conf_drivers_nvme=1)
+endif
+endif
+
+ifeq ($(conf_net_mininet),1)
+ifneq ($(conf_drivers_ena),1)
+$(error conf_net_mininet=1 needs conf_drivers_ena=1)
 endif
 endif
 
@@ -360,8 +381,15 @@ $(out)/libc/%.o: source-dialects =
 # do not hide symbols in libc because it has its own hiding mechanism
 
 kernel-defines = -D_KERNEL $(source-dialects) \
+	-DCONF_drivers_acpi=$(conf_drivers_acpi) \
+	-DCONF_drivers_pci=$(conf_drivers_pci) \
+	-DCONF_drivers_ena=$(conf_drivers_ena) \
+	-DCONF_drivers_nvme=$(conf_drivers_nvme) \
+	-DCONF_drivers_virtio=$(conf_drivers_virtio) \
+	-DCONF_drivers_virtio_accel=$(conf_drivers_virtio_accel) \
 	-DCONF_fs_miniext=$(conf_fs_miniext) \
 	-DCONF_memory_histogram=$(conf_memory_histogram) \
+	-DCONF_net_mininet=$(conf_net_mininet) \
 	-DCONF_nvme_max_queue_depth=$(conf_nvme_max_queue_depth) \
 	-DCONF_pagecache_stats=$(conf_pagecache_stats)
 
@@ -605,18 +633,20 @@ endif
 # objects in $(app-objects); the kernel compiles and links them with its own
 # flags. Only one can be linked at a time -- two osv_app_main() would collide.
 #
-#   make                    -> app/, the placeholder app.cc
-#   make app=test           -> the test suite in test/
-#   make app=app/miniduckdb -> DuckDB    (submodule)
-#   make app=app/llama.cpp  -> llama.cpp (submodule)
-#   make app=<directory>    -> that directory, in the tree or out of it
 #
 # A directory is all an application is: its Makefile derives the rest of the
 # tree from its own path, so the same source builds in place or copied to app/.
 # The nix layer relies on the latter -- it stages an app source there and runs
 # plain `make`. A submodule needs 'git submodule update --init' first.
+app-mk-duckdb = app/miniduckdb/miniosv/miniosv.mk
+app-mk-llama = app/llama.cpp/miniosv/miniosv.mk
 app ?= app
-include $(app)/Makefile
+app-mk := $(or $(app-mk-$(app)),$(app)/Makefile)
+ifeq ($(wildcard $(app-mk)),)
+$(error no $(app-mk) for app '$(app)': give a directory holding a Makefile, or \
+one of the named apps above)
+endif
+include $(app-mk)
 objects += $(app-objects)
 
 # Record the selected app so that switching between `make` and `make app=test`
@@ -628,6 +658,16 @@ $(app_mode_dep): app_mode_phony
 	$(call very-quiet, $(makedir))
 	@if [ "$$(cat $(app_mode_dep) 2>/dev/null)" != "$(app)" ]; then \
 		echo -n "$(app)" > $(app_mode_dep); \
+	fi
+
+# Application object path for the deferred constructors (.init_array_late).
+app_init_late = $(out)/app_init_late.ld
+app_objs = *$(patsubst %/,%,$(app))/*
+app_init_late_pattern = KEEP($(app_objs)(SORT_BY_INIT_PRIORITY(.init_array.*) SORT_BY_INIT_PRIORITY(.ctors.*))) KEEP($(app_objs)(.init_array .ctors))
+$(app_init_late): app_mode_phony
+	$(call very-quiet, $(makedir))
+	@if [ "$$(cat $(app_init_late) 2>/dev/null)" != "$(app_init_late_pattern)" ]; then \
+		echo '$(app_init_late_pattern)' > $(app_init_late); \
 	fi
 # Minimal boot-time self-relocator (replaces the relocation half of the old
 # ELF loader). Per-arch: the relocation-type switch differs (x64 vs aarch64).
@@ -1008,13 +1048,13 @@ define newline
 
 endef
 
-link-inputs = $(patsubst %.ld,-T %.ld,$(filter-out $(app_mode_dep) $(llvm_libc_dep) $(libcxx_dep) $(compiler_rt_dep),$^))
+link-inputs = $(patsubst %.ld,-T %.ld,$(filter-out $(app_mode_dep) $(app_init_late) $(llvm_libc_dep) $(libcxx_dep) $(compiler_rt_dep),$^))
 
-$(out)/loader.elf: $(stage1_targets) arch/$(arch)/loader.ld $(app_mode_dep) $(llvm_libc_dep) $(libcxx_dep) $(compiler_rt_dep)
+$(out)/loader.elf: $(stage1_targets) arch/$(arch)/loader.ld $(app_mode_dep) $(app_init_late) $(llvm_libc_dep) $(libcxx_dep) $(compiler_rt_dep)
 	$(call very-quiet, $(makedir))
 	$(file > $@.objects,$(subst $(space),$(newline),$(link-inputs)))
 	$(call quiet, $(LD) -o $@ $(def_symbols) \
-		-static --eh-frame-hdr -L$(out)/arch/$(arch) \
+		-static --eh-frame-hdr -L$(out)/arch/$(arch) -L$(out) \
 	    @$@.objects \
 	    $(linker_archives_options) $(conf_linker_extra_options), \
 		LINK loader.elf)
@@ -1042,8 +1082,8 @@ perhaps-modify-version-h:
 	$(call quiet, sh scripts/gen-version-header $(out)/gen/include/osv/version.h, GEN gen/include/osv/version.h)
 .PHONY: perhaps-modify-version-h
 
-# The CONF_drivers_* macros used by source code (e.g. arch-setup.cc) are frozen
-# in the checked-in include/osv/drivers_config.h; nothing is generated here.
+# The CONF_drivers_* macros reach the code through kernel-defines above;
+# include/osv/drivers_config.h only holds defaults for a compile outside make.
 
 $(out)/gen/include/bits/alltypes.h: include/api/$(arch)/bits/alltypes.h.sh
 	$(makedir)

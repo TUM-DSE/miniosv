@@ -202,6 +202,12 @@ inline void arch_cpu::init_on_cpu()
     // In at least one particular version of Xen it is not, leading to SIMD exceptions.
     processor::init_fpu();
 
+    // PAT entry 1 (PWT set, PCD clear) becomes write-combining; the other
+    // seven keep their reset values, so existing mappings are unchanged.
+    // mattr::wc mappings select it for device BARs written in bursts, such as
+    // ENA's LLQ. Every cpu needs it before it touches such a mapping.
+    processor::wrmsr(msr::IA32_PAT, 0x0007040600070106ULL);
+
     processor::wrmsr(msr::IA32_GS_BASE, reinterpret_cast<u64>(&_current_thread_kernel_tcb));
 }
 
