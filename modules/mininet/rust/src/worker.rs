@@ -20,7 +20,7 @@ use crate::dns;
 use crate::endpoint::Endpoint;
 use crate::error::Error;
 use crate::http::BodySink;
-use crate::ffi::rte_pktmbuf_pool;
+use crate::ffi::{rte_pktmbuf_pool, shim_time_seconds};
 use crate::rss::{Rss, EPH_LEN};
 use crate::tls;
 use crate::Netif;
@@ -101,10 +101,13 @@ pub struct Worker {
 
 /// Different on every boot and every queue: where a worker starts in its share of the ephemeral ports.
 fn boot_salt(queue_id: u16) -> usize {
-    // The TSC at boot is as good as random here; mininet is x64 only, like the NIC drivers.
+    // Back-to-back boots differ little in TSC, and a server may still hold the last boot's connections: mix in the
+    // wall clock, and fold every bit into the low ones the port choice uses. mininet is x64 only, like the NIC drivers.
     let t = unsafe { core::arch::x86_64::_rdtsc() };
-    let x = (t ^ ((queue_id as u64) << 32)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-    (x >> 17) as usize
+    let mut z = t ^ unsafe { shim_time_seconds() }.rotate_left(32) ^ ((queue_id as u64) << 56);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    (z ^ (z >> 31)) as usize
 }
 
 impl Worker {
@@ -381,6 +384,23 @@ impl Worker {
             slot.step(&mut self.sockets, now_ns);
         }
         self.last_busy_ns = self.clk.elapsed_ns().saturating_sub(start_ns);
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// Frames already off the ring that the next poll still has to process.
+    pub fn rx_buffered(&self) -> bool {
+        self.dev.has_buffered()
+    }
+
+    /// When smoltcp next needs a poll for its own timers (retransmission, keep-alive), from now; `None` if never.
+    pub fn next_timer_ns(&mut self) -> Option<u64> {
+        let now_ms = (self.clk.elapsed_ns() / 1_000_000) as i64;
+        self.iface
+            .poll_delay(Instant::from_millis(now_ms), &self.sockets)
+            .map(|d| d.total_micros() * 1000)
     }
 
     pub fn last_poll_ns(&self) -> u64 {

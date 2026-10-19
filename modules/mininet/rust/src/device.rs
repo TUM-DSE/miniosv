@@ -110,6 +110,11 @@ impl DpdkDevice {
     }
 
     /// Packets received and transmitted since the last call.
+    /// Frames fetched from the ring but not yet handed to smoltcp (the poll budget ran out).
+    pub(crate) fn has_buffered(&self) -> bool {
+        self.rx_pref_pos < self.rx_pref_len
+    }
+
     pub fn take_counts(&mut self) -> (u64, u64) {
         let r = (self.rx_pkts, self.tx_pkts);
         self.rx_pkts = 0;
@@ -142,6 +147,18 @@ impl DpdkDevice {
             stats::misrouted_drop();
             false
         }
+    }
+}
+
+/// The NIC writes frames to memory, not cache: without this, each header read is a miss to DRAM.
+const RX_PREFETCH_AHEAD: usize = 4;
+
+fn prefetch_header(p: *const u8) {
+    // Ethernet, IPv4 and TCP with options can cross into a second line.
+    unsafe {
+        use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+        _mm_prefetch(p as *const i8, _MM_HINT_T0);
+        _mm_prefetch(p.wrapping_add(64) as *const i8, _MM_HINT_T0);
     }
 }
 
@@ -278,9 +295,15 @@ impl Device for DpdkDevice {
                 }
                 self.rx_pref_pos = 0;
                 self.rx_pref_len = got;
+                for k in 0..core::cmp::min(got as usize, RX_PREFETCH_AHEAD) {
+                    prefetch_header(self.rx_pref_data[k]);
+                }
             }
             let i = self.rx_pref_pos as usize;
             self.rx_pref_pos += 1;
+            if i + RX_PREFETCH_AHEAD < self.rx_pref_len as usize {
+                prefetch_header(self.rx_pref_data[i + RX_PREFETCH_AHEAD]);
+            }
             let handle = self.rx_pref_handles[i];
             let data = self.rx_pref_data[i];
             let len = self.rx_pref_lens[i] as usize;

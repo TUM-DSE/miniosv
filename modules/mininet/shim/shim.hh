@@ -15,7 +15,7 @@ void *shim_pktmbuf_pool_create(const char *name, uint32_t n,
                                 uint16_t data_room_size);
 
 int shim_eth_dev_configure(uint16_t port_id, uint16_t nb_rx_q,
-                            uint16_t nb_tx_q);
+                            uint16_t nb_tx_q, int rx_intr);
 
 // Frame size. ENA powers up at 1500 and silently drops anything larger, so
 // jumbo needs the MTU programmed explicitly; max_mtu is what the device
@@ -54,11 +54,21 @@ uint16_t shim_mbuf_rx_burst_n(uint16_t port_id, uint16_t queue_id,
                                void **out_handles, const uint8_t **out_data,
                                uint16_t *out_lens, uint16_t max);
 
-void *shim_thread_spawn(void (*fn)(void *), void *arg, int cpu_id);
+// Flags for shim_thread_spawn: keep everything else off the pinned cpu, or own it only while awake (a heavy fair
+// share, and threads waking there go elsewhere) and lend it out across shim_waiter_wait.
+#define SHIM_THREAD_RESERVE 1u
+#define SHIM_THREAD_BOOST 2u
+void *shim_thread_spawn(void (*fn)(void *), void *arg, int cpu_id, unsigned flags);
 void shim_thread_join(void *handle);
 
 // Park until *flag is nonzero; the waker stores the flag, then unparks the handle.
 void *shim_thread_current(void);
+void *shim_waiter_new(void);
+void shim_waiter_signal(void *waiter);
+// 1 if signalled, 0 if it timed out.
+uint32_t shim_waiter_wait(void *waiter, uint64_t timeout_ns);
+int shim_rx_intr_arm(uint16_t port_id, uint16_t queue_id, void *waiter);
+int shim_rx_intr_disarm(uint16_t port_id, uint16_t queue_id);
 void shim_thread_park(const unsigned int *flag);
 void shim_thread_unpark(void *handle);
 

@@ -3,6 +3,7 @@
 //! EC2 means one per attached ENI; `count()` is how many the drivers found.
 
 use alloc::vec::Vec;
+use core::ffi::c_int;
 use core::fmt::Write;
 
 use crate::device::RX_BURST;
@@ -52,6 +53,7 @@ pub(crate) fn probe_and_open(
     port: u16,
     n_queues: u16,
     rx_desc: u16,
+    rx_intr: bool,
 ) -> Result<(Vec<PktPool>, [u8; 6]), Error> {
     const DATA_ROOM_SIZE: u16 = 9216;
     // 1024 descriptors dropped 3.3% of inbound frames (imissed) between polls.
@@ -74,7 +76,7 @@ pub(crate) fn probe_and_open(
         pools.push(PktPool(raw));
     }
 
-    if unsafe { shim_eth_dev_configure(port, n_queues, n_queues) } != 0 {
+    if unsafe { shim_eth_dev_configure(port, n_queues, n_queues, rx_intr as c_int) } != 0 {
         return Err(Error::NoDevice);
     }
     // ENA powers up at 1500 and drops anything larger, so the frame size the

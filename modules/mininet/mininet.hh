@@ -39,6 +39,9 @@ struct config {
     uint32_t workers;
     //! `workers * conns_per_worker` is the in-flight ceiling.
     uint32_t conns_per_worker;
+    //! 0: each worker polls its queue forever on a cpu of its own. Otherwise a worker that has had nothing to do
+    //! for this long arms its queue's interrupt and sleeps, and its cpu runs other threads until traffic returns.
+    uint32_t idle_us;
 };
 
 enum : size_t {
@@ -123,6 +126,9 @@ struct conn_stats {
     uint64_t nic_imissed;
     uint64_t nic_ierrors;
     uint64_t nic_rx_nombuf;
+    uint64_t idle_sleeps;
+    uint64_t idle_ns_total;
+    uint64_t idle_signalled;
 };
 
 conn_stats stats();

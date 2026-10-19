@@ -31,6 +31,9 @@ static ACTIVE_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static RX_JUMBO_PKTS: AtomicU64 = AtomicU64::new(0);
 static RX_JUMBO_BYTES: AtomicU64 = AtomicU64::new(0);
 static RX_LEN_MAX: AtomicU64 = AtomicU64::new(0);
+static IDLE_SLEEPS: AtomicU64 = AtomicU64::new(0);
+static IDLE_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static IDLE_SIGNALLED: AtomicU64 = AtomicU64::new(0);
 
 static SETUP_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SETUP_NS_MAX: AtomicU64 = AtomicU64::new(0);
@@ -202,6 +205,11 @@ pub struct Stats {
     pub nic_imissed: u64,
     pub nic_ierrors: u64,
     pub nic_rx_nombuf: u64,
+    /// Workers that slept on their queue's interrupt (`idle_us`): how often, for how long in all, and how many of
+    /// those sleeps a packet or a request ended rather than a timer.
+    pub idle_sleeps: u64,
+    pub idle_ns_total: u64,
+    pub idle_signalled: u64,
 }
 
 /// Received frames, batched by the caller. "Jumbo" is any frame over the
@@ -240,6 +248,7 @@ pub fn reset(now_ns: u64) {
         &GET_CALLS, &GET_NS_TOTAL, &ACTIVE_NS_TOTAL,
         &SETUP_NS_TOTAL, &SETUP_NS_MAX, &DIAL_NS_TOTAL, &DIAL_NS_MAX,
         &RX_JUMBO_PKTS, &RX_JUMBO_BYTES, &RX_LEN_MAX,
+        &IDLE_SLEEPS, &IDLE_NS_TOTAL, &IDLE_SIGNALLED,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -304,6 +313,18 @@ pub fn snapshot() -> Stats {
         nic_imissed: nic.imissed,
         nic_ierrors: nic.ierrors,
         nic_rx_nombuf: nic.rx_nombuf,
+        idle_sleeps: IDLE_SLEEPS.load(Ordering::Relaxed),
+        idle_ns_total: IDLE_NS_TOTAL.load(Ordering::Relaxed),
+        idle_signalled: IDLE_SIGNALLED.load(Ordering::Relaxed),
+    }
+}
+
+/// One sleep of an idle worker; counted per sleep, not per packet.
+pub(crate) fn worker_slept(ns: u64, signalled: bool) {
+    IDLE_SLEEPS.fetch_add(1, Ordering::Relaxed);
+    IDLE_NS_TOTAL.fetch_add(ns, Ordering::Relaxed);
+    if signalled {
+        IDLE_SIGNALLED.fetch_add(1, Ordering::Relaxed);
     }
 }
 

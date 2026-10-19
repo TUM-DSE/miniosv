@@ -14,6 +14,9 @@
 #include <osv/debug.hh>
 #include <osv/sched.hh>
 
+#include <atomic>
+#include <chrono>
+
 namespace {
 
 // Checksum offloads asked of ENA; what each queue accepts is filled in by shim_eth_dev_configure.
@@ -65,7 +68,7 @@ void *shim_pktmbuf_pool_create(const char *name, uint32_t n,
 }
 
 int shim_eth_dev_configure(uint16_t port_id, uint16_t nb_rx_q,
-                            uint16_t nb_tx_q) {
+                            uint16_t nb_tx_q, int rx_intr) {
   auto *dev = lookup_dev(port_id);
   if (!dev) return -1;
   rte_eth_dev_info info;
@@ -84,6 +87,8 @@ int shim_eth_dev_configure(uint16_t port_id, uint16_t nb_rx_q,
     conf.rxmode.mq_mode = RTE_ETH_MQ_RX_RSS;
     conf.rx_adv_conf.rss_conf.rss_hf = RTE_ETH_RSS_NONFRAG_IPV4_TCP;
   }
+  // An interrupt per Rx queue, for workers that sleep when idle (shim_rx_intr_arm).
+  conf.intr_conf.rxq = rx_intr ? 1 : 0;
   return rte_eth_dev_configure(port_id, nb_rx_q, nb_tx_q, &conf);
 }
 
@@ -328,15 +333,26 @@ uint64_t shim_cpu_count(void) {
   return static_cast<uint64_t>(sched::cpus.size());
 }
 
-void *shim_thread_spawn(void (*fn)(void *), void *arg, int cpu_id) {
+// Against one other thread, a boosted worker gets 1 / (1 + this) of its cpu; a thread caught there when the worker
+// woke keeps the rest until it next sleeps and wakes elsewhere.
+static constexpr float kBoostPriority = 0.05f;
+
+void *shim_thread_spawn(void (*fn)(void *), void *arg, int cpu_id, unsigned flags) {
   sched::thread::attr attrs;
   if (cpu_id >= 0 && static_cast<size_t>(cpu_id) < sched::cpus.size()) {
     attrs.pin(sched::cpus[cpu_id]);
-    // A pinned shim thread is a poller that never yields; reserve its cpu first.
-    sched::reserve_cpu(static_cast<unsigned>(cpu_id));
+    // A poller that never yields wants its cpu to itself.
+    if (flags & SHIM_THREAD_RESERVE)
+      sched::reserve_cpu(static_cast<unsigned>(cpu_id));
   }
   sched::thread *t =
       sched::thread::make([fn, arg]() { fn(arg); }, attrs);
+  // A worker that sleeps when idle shares its cpu and takes it back the moment it wakes. Fair-share, not real-time:
+  // a real-time poller starves whatever was queued behind it while it slept, for as long as the I/O lasts.
+  if ((flags & SHIM_THREAD_BOOST) && cpu_id >= 0 && static_cast<size_t>(cpu_id) < sched::cpus.size()) {
+    t->set_priority(kBoostPriority);
+    sched::lend_cpu(static_cast<unsigned>(cpu_id), false);
+  }
   t->start();
   return static_cast<void *>(t);
 }
@@ -348,6 +364,55 @@ void shim_thread_join(void *handle) {
 }
 
 void *shim_thread_current() { return sched::thread::current(); }
+
+// One thread's sleep: signalled by other threads or by an Rx interrupt, or it times out.
+struct shim_waiter {
+  sched::thread *thread;
+  std::atomic<uint32_t> pending{0};
+};
+
+void *shim_waiter_new(void) {
+  auto *w = new shim_waiter;
+  w->thread = sched::thread::current();
+  return w;
+}
+
+void shim_waiter_signal(void *handle) {
+  auto *w = static_cast<shim_waiter *>(handle);
+  w->pending.store(1, std::memory_order_release);
+  w->thread->wake();
+}
+
+uint32_t shim_waiter_wait(void *handle, uint64_t timeout_ns) {
+  auto *w = static_cast<shim_waiter *>(handle);
+  unsigned cpu = sched::cpu::current()->id;
+  sched::timer tmr(*sched::thread::current());
+  tmr.set(std::chrono::nanoseconds(timeout_ns));
+  sched::lend_cpu(cpu, true);
+  sched::thread::wait_until([&] {
+    return w->pending.load(std::memory_order_acquire) != 0 || tmr.expired();
+  });
+  sched::lend_cpu(cpu, false);
+  return w->pending.exchange(0, std::memory_order_acq_rel);
+}
+
+// Arm the queue's interrupt: the next packet signals `waiter`. The interrupt then stays masked until armed again.
+int shim_rx_intr_arm(uint16_t port_id, uint16_t queue_id, void *waiter) {
+  auto *dev = lookup_dev(port_id);
+  if (!dev || queue_id >= dev->data.rx_wakers.size()) return -1;
+  if (!dev->data.rx_wakers[queue_id]) {
+    auto *w = static_cast<shim_waiter *>(waiter);
+    rte_eth_dev_rx_intr_waker(port_id, queue_id, [w] {
+      w->pending.store(1, std::memory_order_release);
+      w->thread->wake_with_irq_disabled();
+    });
+  }
+  return rte_eth_dev_rx_intr_enable(port_id, queue_id);
+}
+
+int shim_rx_intr_disarm(uint16_t port_id, uint16_t queue_id) {
+  return rte_eth_dev_rx_intr_disable(port_id, queue_id);
+}
 
 // wait_until re-checks the predicate under the wait guard, so no wake is lost.
 void shim_thread_park(const unsigned int *flag) {

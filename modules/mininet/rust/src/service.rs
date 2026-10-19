@@ -9,11 +9,14 @@ use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::ffi::c_void;
 use core::ptr;
-use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{fence, AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use crate::endpoint::Endpoint;
 use crate::error::Error;
-use crate::ffi::{shim_thread_current, shim_thread_park, shim_thread_unpark, shim_time_ns};
+use crate::ffi::{
+    shim_rx_intr_arm, shim_rx_intr_disarm, shim_thread_current, shim_thread_park, shim_thread_unpark, shim_time_ns,
+    shim_waiter_new, shim_waiter_signal, shim_waiter_wait, SHIM_THREAD_BOOST, SHIM_THREAD_RESERVE,
+};
 use crate::http::{BodySink, BufferSink, ContentRange};
 use crate::stats;
 use crate::thread;
@@ -97,6 +100,9 @@ struct Queue {
     /// `UP`, or `DOWN` with the error in `boot_err`.
     ready: AtomicU8,
     boot_err: UnsafeCell<Option<Error>>,
+    /// The worker sleeps on `waiter` (idle_us): a push sets it going again.
+    sleeping: AtomicBool,
+    waiter: AtomicPtr<c_void>,
 }
 
 const BOOTING: u8 = 0;
@@ -116,6 +122,8 @@ impl Queue {
             stub,
             ready: AtomicU8::new(BOOTING),
             boot_err: UnsafeCell::new(None),
+            sleeping: AtomicBool::new(false),
+            waiter: AtomicPtr::new(ptr::null_mut()),
         }
     }
 
@@ -123,6 +131,23 @@ impl Queue {
         unsafe { (*slot).next.store(ptr::null_mut(), Ordering::Relaxed) };
         let prev = self.head.swap(slot, Ordering::AcqRel);
         unsafe { (*prev).next.store(slot, Ordering::Release) };
+        // Against the worker's store of `sleeping` and its last look at the queue: one of the two sees the other.
+        fence(Ordering::SeqCst);
+        if self.sleeping.load(Ordering::Relaxed) {
+            let w = self.waiter.load(Ordering::Acquire);
+            if !w.is_null() {
+                unsafe { shim_waiter_signal(w) };
+            }
+        }
+    }
+
+    /// Whether a push may be waiting; consumer side only. A producer between its two stores counts.
+    fn maybe_pending(&self) -> bool {
+        let stub = &*self.stub as *const Slot as *mut Slot;
+        unsafe {
+            let tail = *self.tail.get();
+            tail != stub || !(*stub).next.load(Ordering::Acquire).is_null() || self.head.load(Ordering::SeqCst) != stub
+        }
     }
 
     /// `None` also while a producer is between its two stores; try again next poll.
@@ -164,6 +189,8 @@ pub struct ServiceConfig {
     pub tx_buffer: usize,
     /// Dial the boot-resolved addresses, not `peer.ip`.
     pub resolve: bool,
+    /// 0: poll forever on a reserved cpu. Otherwise sleep on the queue's interrupt after this long with nothing to do.
+    pub idle_ns: u64,
 }
 
 impl ServiceConfig {
@@ -174,6 +201,7 @@ impl ServiceConfig {
             rx_buffer: 4 * 1024 * 1024,
             tx_buffer: 32 * 1024,
             resolve: false,
+            idle_ns: 0,
         }
     }
 }
@@ -202,9 +230,12 @@ impl Service {
             let mine = queue.clone();
             let peer = cfg.peer.clone();
             let (conns, rx, tx, resolve) = (cfg.conns_per_worker, cfg.rx_buffer, cfg.tx_buffer, cfg.resolve);
+            let idle_ns = cfg.idle_ns;
+            let flags = if idle_ns == 0 { SHIM_THREAD_RESERVE } else { SHIM_THREAD_BOOST };
             thread::spawn(
-                move || serve(handle, peer, conns, rx, tx, resolve, mine),
+                move || serve(handle, peer, conns, rx, tx, resolve, idle_ns, mine),
                 Some(worker_cpu(q)),
+                flags,
             );
             queues.push(queue);
         }
@@ -281,6 +312,7 @@ pub(crate) fn queue_selftest() -> (u64, u64, u64) {
                 }
             },
             None,
+            0,
         ));
     }
     let total = (PRODUCERS * EACH) as u64;
@@ -373,6 +405,7 @@ fn serve(
     rx_buffer: usize,
     tx_buffer: usize,
     resolve: bool,
+    idle_ns: u64,
     queue: Arc<Queue>,
 ) {
     let queue_id = handle.queue_id();
@@ -392,7 +425,10 @@ fn serve(
             return;
         }
     };
+    let waiter = if idle_ns != 0 { unsafe { shim_waiter_new() } } else { ptr::null_mut() };
+    queue.waiter.store(waiter, Ordering::Release);
     queue.ready.store(UP, Ordering::Release);
+    let mut idle_since_ns = unsafe { shim_time_ns() };
 
     let mut pending: Vec<Option<Pending>> = (0..w.slots()).map(|_| None).collect();
     let epoch_ns = w.clock().epoch_ns();
@@ -413,10 +449,12 @@ fn serve(
         }
         prev_poll_ns = now_ns;
         prev_busy_ns = w.last_busy_ns();
+        let mut progress = false;
 
         for slot in 0..w.slots() {
             let Some(pd) = pending[slot] else {
                 let Some(p) = queue.pop() else { continue };
+                progress = true;
                 let s = unsafe { &*p };
                 let reused = w.idle_reusable(slot);
                 let opened = if reused {
@@ -436,6 +474,7 @@ fn serve(
                 continue;
             };
             let Some(step) = w.conn(slot).and_then(|c| c.outcome()) else { continue };
+            progress = true;
             let res = match step {
                 crate::Step::Complete => result_of(w.conn_mut(slot).expect("just observed")),
                 crate::Step::Failed(e) => Err(e),
@@ -479,5 +518,42 @@ fn serve(
                 w.release(slot);
             }
         }
+
+        if idle_ns == 0 {
+            continue;
+        }
+        let (rxp, txp) = w.last_dev();
+        if progress || rxp != 0 || txp != 0 || w.last_active() || w.rx_buffered() {
+            idle_since_ns = now_ns;
+        } else if now_ns.saturating_sub(idle_since_ns) >= idle_ns {
+            sleep_until_work(&mut w, &queue, waiter, queue_id);
+            idle_since_ns = unsafe { shim_time_ns() };
+        }
     }
+}
+
+/// The longest an idle worker sleeps without being woken: smoltcp's timers and the address refresh are seconds.
+const MAX_SLEEP_NS: u64 = 10_000_000;
+
+/// Arm the queue's interrupt and sleep until a packet, a request or smoltcp's next timer. The worker polls once
+/// more after arming: what arrived before the interrupt was armed raised none.
+fn sleep_until_work(w: &mut Worker, queue: &Queue, waiter: *mut c_void, queue_id: u16) {
+    let port = w.port();
+    queue.sleeping.store(true, Ordering::Relaxed);
+    fence(Ordering::SeqCst);
+    if unsafe { shim_rx_intr_arm(port, queue_id, waiter) } != 0 {
+        // The device cannot interrupt: stay a poller.
+        queue.sleeping.store(false, Ordering::Relaxed);
+        return;
+    }
+    w.poll();
+    let (rxp, _) = w.last_dev();
+    if rxp == 0 && !w.rx_buffered() && !queue.maybe_pending() {
+        let timeout = w.next_timer_ns().unwrap_or(MAX_SLEEP_NS).min(MAX_SLEEP_NS);
+        let t0 = unsafe { shim_time_ns() };
+        let signalled = unsafe { shim_waiter_wait(waiter, timeout) } != 0;
+        stats::worker_slept(unsafe { shim_time_ns() }.saturating_sub(t0), signalled);
+    }
+    unsafe { shim_rx_intr_disarm(port, queue_id) };
+    queue.sleeping.store(false, Ordering::Relaxed);
 }

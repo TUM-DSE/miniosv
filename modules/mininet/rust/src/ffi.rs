@@ -30,7 +30,7 @@ extern "C" {
         priv_size: u16,
         data_room_size: u16,
     ) -> *mut rte_pktmbuf_pool;
-    pub fn shim_eth_dev_configure(port_id: u16, nb_rx_q: u16, nb_tx_q: u16) -> c_int;
+    pub fn shim_eth_dev_configure(port_id: u16, nb_rx_q: u16, nb_tx_q: u16, rx_intr: c_int) -> c_int;
     pub fn shim_eth_max_mtu(port_id: u16) -> u16;
     pub fn shim_eth_set_mtu(port_id: u16, mtu: u16) -> c_int;
     pub fn shim_adjust_nb_rx_tx_desc(port_id: u16, nb_rx_desc: *mut u16, nb_tx_desc: *mut u16);
@@ -65,10 +65,20 @@ extern "C" {
     pub fn shim_rss_reta(port_id: u16, out: *mut u16, out_entries: u16) -> c_int;
     pub fn shim_eth_stats(port_id: u16, out: *mut u64, n: u16) -> c_int;
 
-    pub fn shim_thread_spawn(f: extern "C" fn(*mut c_void), arg: *mut c_void, cpu_id: c_int) -> *mut c_void;
+    pub fn shim_thread_spawn(f: extern "C" fn(*mut c_void), arg: *mut c_void, cpu_id: c_int, flags: u32) -> *mut c_void;
     pub fn shim_thread_join(handle: *mut c_void);
     pub fn shim_thread_current() -> *mut c_void;
     pub fn shim_thread_park(flag: *const u32);
     pub fn shim_thread_unpark(handle: *mut c_void);
+    pub fn shim_waiter_new() -> *mut c_void;
+    pub fn shim_waiter_signal(waiter: *mut c_void);
+    /// 1 if signalled, 0 if it timed out.
+    pub fn shim_waiter_wait(waiter: *mut c_void, timeout_ns: u64) -> u32;
+    pub fn shim_rx_intr_arm(port_id: u16, queue_id: u16, waiter: *mut c_void) -> c_int;
+    pub fn shim_rx_intr_disarm(port_id: u16, queue_id: u16) -> c_int;
 }
+
+/// `shim_thread_spawn` flags, as shim.hh has them.
+pub const SHIM_THREAD_RESERVE: u32 = 1;
+pub const SHIM_THREAD_BOOST: u32 = 2;
 
