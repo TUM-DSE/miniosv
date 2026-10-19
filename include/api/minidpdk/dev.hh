@@ -189,6 +189,7 @@ struct rte_eth_dev {
     data.dev_conf.rxmode = conf->rxmode;
     data.dev_conf.txmode = conf->txmode;
     data.dev_conf.rx_adv_conf = conf->rx_adv_conf;
+    data.dev_conf.intr_conf = conf->intr_conf;
     data.tx_queues.resize(nb_tx, nullptr);
     data.rx_queues.resize(nb_rx, nullptr);
     data.tx_queue_state.resize(nb_tx, RTE_ETH_QUEUE_STATE_STOPPED);

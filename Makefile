@@ -156,9 +156,10 @@ conf_pagecache_stats=0
 
 # --- network ---------------------------------------------------------------
 # mininet is a minimal HTTP client stack the application calls directly
-# (modules/mininet/mininet.hh). There is no socket layer. It drives the ENA
-# NIC itself, so it needs conf_drivers_ena, and like the driver it is x64
-# only: the crate is built for the host. Apps link it via mininet.mk.
+# (modules/mininet/mininet.hh). There is no socket layer. It drives the NIC
+# itself, so it needs conf_drivers_ena or conf_drivers_iavf, and like the
+# drivers it is x64 only: the crate is built for the host. Apps link it via
+# mininet.mk.
 ifeq ($(arch),x64)
 conf_net_mininet=1
 else
@@ -179,6 +180,13 @@ conf_drivers_ena=1
 else
 conf_drivers_ena=0
 endif
+# Intel's adaptive virtual function (an SR-IOV VF of an E810 or X710), from
+# DPDK's iavf PMD. x64 only, like ENA.
+ifeq ($(arch),x64)
+conf_drivers_iavf=1
+else
+conf_drivers_iavf=0
+endif
 conf_drivers_nvme=1
 # vAccel needs virtio transport drivers (bus, vring, PCI).
 conf_drivers_virtio=1
@@ -197,8 +205,9 @@ endif
 endif
 
 ifeq ($(conf_net_mininet),1)
-ifneq ($(conf_drivers_ena),1)
-$(error conf_net_mininet=1 needs conf_drivers_ena=1)
+ifneq ($(conf_drivers_ena)$(conf_drivers_iavf),00)
+else
+$(error conf_net_mininet=1 needs conf_drivers_ena=1 or conf_drivers_iavf=1)
 endif
 endif
 
@@ -384,6 +393,7 @@ kernel-defines = -D_KERNEL $(source-dialects) \
 	-DCONF_drivers_acpi=$(conf_drivers_acpi) \
 	-DCONF_drivers_pci=$(conf_drivers_pci) \
 	-DCONF_drivers_ena=$(conf_drivers_ena) \
+	-DCONF_drivers_iavf=$(conf_drivers_iavf) \
 	-DCONF_drivers_nvme=$(conf_drivers_nvme) \
 	-DCONF_drivers_virtio=$(conf_drivers_virtio) \
 	-DCONF_drivers_virtio_accel=$(conf_drivers_virtio_accel) \
@@ -603,6 +613,15 @@ drivers += drivers/enav2/base/ena_eth_com.o
 drivers += drivers/enav2/base/ena_com.o
 drivers += drivers/enav2/ena_ethdev.o
 drivers += drivers/enav2/ena_rss.o
+endif
+ifeq ($(conf_drivers_iavf),1)
+drivers += drivers/iavf/base/iavf_adminq.o
+drivers += drivers/iavf/base/iavf_common.o
+drivers += drivers/iavf/base/iavf_osdep.o
+drivers += drivers/iavf/iavf.o
+drivers += drivers/iavf/iavf_ethdev.o
+drivers += drivers/iavf/iavf_vchnl.o
+drivers += drivers/iavf/iavf_rxtx.o
 endif
 drivers += drivers/driver.o
 

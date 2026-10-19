@@ -11,6 +11,9 @@
 #ifndef CONF_drivers_ena
 #define CONF_drivers_ena 1
 #endif
+#ifndef CONF_drivers_iavf
+#define CONF_drivers_iavf 1
+#endif
 #ifndef CONF_drivers_nvme
 #define CONF_drivers_nvme 1
 #endif
