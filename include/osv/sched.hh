@@ -1541,6 +1541,10 @@ extern std::vector<cpu*> cpus;
 // Keep unpinned threads off `id`; refuses to reserve the last free cpu.
 bool reserve_cpu(unsigned id);
 
+// For an owner that only sometimes needs `id`: reserved while it does, and
+// threads waking there go elsewhere; lent, the cpu is anyone's.
+void lend_cpu(unsigned id, bool lent);
+
 inline void migrate_disable()
 {
     thread::current()->_migration_lock_counter++;

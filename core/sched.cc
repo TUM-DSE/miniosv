@@ -537,13 +537,22 @@ static cpu *idle_cpu_after(unsigned from)
     return nullptr;
 }
 
+static cpu *placement_cpu();
+
 // Where a thread waking up here should run instead, if this cpu is busy
-// with another thread and one idles. Nullptr keeps it here.
+// with another thread and one idles, or its owner has it back. Nullptr keeps
+// it here.
 cpu *cpu::forward_to(thread &t)
 {
+    if (!t.migratable() || t.pinned()) {
+        return nullptr;
+    }
+    if (reserved.load(std::memory_order_relaxed)) {
+        cpu *alt = idle_cpu_after(id) ?: placement_cpu();
+        return alt == this ? nullptr : alt;
+    }
     thread *cur = thread::current();
-    if (cur == idle_thread || cur->_detached_state->st.load(std::memory_order_relaxed) != thread::status::running ||
-        !t.migratable() || t.pinned()) {
+    if (cur == idle_thread || cur->_detached_state->st.load(std::memory_order_relaxed) != thread::status::running) {
         return nullptr;
     }
     return idle_cpu_after(id);
@@ -641,7 +650,6 @@ unsigned cpu::load()
 }
 
 static std::atomic<unsigned> cpus_reserved;
-static cpu *placement_cpu();
 
 // A spinning owner is running, not queued, so placement thinks its cpu is empty.
 bool reserve_cpu(unsigned id)
@@ -667,6 +675,13 @@ bool reserve_cpu(unsigned id)
         }
     }
     return true;
+}
+
+void lend_cpu(unsigned id, bool lent)
+{
+    if (id < cpus.size()) {
+        cpus[id]->reserved.store(!lent, std::memory_order_release);
+    }
 }
 
 static bool available(cpu *c)
