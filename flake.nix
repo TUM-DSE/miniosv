@@ -63,6 +63,9 @@
           gptfdisk
           e2fsprogs
           (python3.withPackages (ps: [ ps.pyyaml ]))
+          # modules/mininet is a Rust crate, built on x64 by default
+          cargo
+          rustc
         ];
 
         ovmf_prefix = if system == "x86_64-linux" then "OVMF" else "AAVMF";
@@ -123,9 +126,7 @@
               ++ aws.nativeBuildInputs;
           });
 
-          rust = cli.overrideAttrs (cli: {
-            nativeBuildInputs = [ pkgs.cargo ] ++ cli.nativeBuildInputs;
-          });
+          rust = cli;
         };
       }
     );
