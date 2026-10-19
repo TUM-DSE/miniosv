@@ -30,6 +30,8 @@ default = []
 rustcrypto = ["dep:rustls-rustcrypto"]
 # The pure-logic tests behind mininet_selftest(); `make app=test` turns it on.
 selftest = ["smoltcp/alloc"]  # the loopback device
+# Trust one more CA, a DER file named by MININET_EXTRA_ROOT at build time: a test server standing in for S3.
+extra-root = []
 
 # rustls no_std, TLS 1.3 only; ring is the provider.
 [dependencies.rustls]

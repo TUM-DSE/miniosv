@@ -164,11 +164,19 @@ impl OwnedPorts {
 
     /// Up to `want` ports, spread across the range.
     pub(crate) fn spread(&self, want: usize) -> Vec<u16> {
+        self.spread_from(want, 0)
+    }
+
+    /// `spread`, starting `phase` owned ports in. A boot that always took the same ports would find the peer still
+    /// holding the last boot's connections on them: its SYNs draw challenge ACKs, and each dial waits out a SYN
+    /// retransmission (a second).
+    pub(crate) fn spread_from(&self, want: usize, phase: usize) -> Vec<u16> {
         let mut out = Vec::with_capacity(want);
         if want == 0 {
             return out;
         }
         let stride = core::cmp::max(1, (self.count as usize) / want);
+        let phase = phase % stride;
         let mut seen = 0usize;
         for i in 0..EPH_LEN {
             if out.len() == want {
@@ -176,7 +184,7 @@ impl OwnedPorts {
             }
             let port = EPH_BASE + i as u16;
             if self.contains(port) {
-                if seen % stride == 0 {
+                if seen >= phase && (seen - phase) % stride == 0 {
                     out.push(port);
                 }
                 seen += 1;

@@ -44,6 +44,10 @@ fn provider() -> rustls::crypto::CryptoProvider {
 pub(crate) fn client_config() -> Arc<ClientConfig> {
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    #[cfg(feature = "extra-root")]
+    roots
+        .add(rustls::pki_types::CertificateDer::from(&include_bytes!(env!("MININET_EXTRA_ROOT"))[..]))
+        .expect("rustls: MININET_EXTRA_ROOT is not a usable CA certificate");
     let cfg = ClientConfig::builder_with_details(
         Arc::new(provider()),
         Arc::new(ShimTimeProvider),

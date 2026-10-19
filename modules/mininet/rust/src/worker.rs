@@ -26,6 +26,8 @@ use crate::tls;
 use crate::Netif;
 
 const PORT_ROTATION: usize = 8;
+/// Frames one interface poll takes in before it turns to sending: a few RX bursts, so ACKs keep pace with data.
+const RX_POLL_BUDGET: u32 = 128;
 /// smoltcp forgets a neighbour after 60 s, and only queue 0 hears ARP replies.
 const RESEED_MS: i64 = 30_000;
 
@@ -97,6 +99,14 @@ pub struct Worker {
     last_dev: (u64, u64),
 }
 
+/// Different on every boot and every queue: where a worker starts in its share of the ephemeral ports.
+fn boot_salt(queue_id: u16) -> usize {
+    // The TSC at boot is as good as random here; mininet is x64 only, like the NIC drivers.
+    let t = unsafe { core::arch::x86_64::_rdtsc() };
+    let x = (t ^ ((queue_id as u64) << 32)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    (x >> 17) as usize
+}
+
 impl Worker {
     pub fn new(h: WorkerHandle, cfg: &WorkerConfig) -> Result<Worker, Error> {
         let clk = MonoClock::new();
@@ -112,7 +122,7 @@ impl Worker {
             .rss
             .owned_ports(peer.ip, peer.port, netif.ip, h.queue_id);
         let slots = owned.spread(cfg.conns).len();
-        let rotation = owned.spread(cfg.conns * PORT_ROTATION);
+        let rotation = owned.spread_from(cfg.conns * PORT_ROTATION, boot_salt(h.queue_id));
         if slots == 0 {
             println!("FAIL: p{}q{}: no ephemeral port steers here", h.port, h.queue_id);
             return Err(Error::NoPorts);
@@ -183,7 +193,7 @@ impl Worker {
             conns,
             bufs,
             rotation,
-            next_port: 0,
+            next_port: boot_salt(h.queue_id) >> 16,
             peer,
             resolve: cfg.resolve,
             shift: 0,
@@ -218,7 +228,7 @@ impl Worker {
             return;
         }
         let owned = self.rss.owned_ports(ip, self.peer.port, self.netif.ip, self.queue_id);
-        let rotation = owned.spread(self.want_conns * PORT_ROTATION);
+        let rotation = owned.spread_from(self.want_conns * PORT_ROTATION, boot_salt(self.queue_id));
         if rotation.is_empty() {
             return;
         }
@@ -354,6 +364,7 @@ impl Worker {
             self.dev.pending_synth = Some(self.synth.clone());
             self.next_seed_ms = now_ms + RESEED_MS;
         }
+        self.dev.rx_budget = RX_POLL_BUDGET;
         let res = self
             .iface
             .poll(Instant::from_millis(now_ms), &mut self.dev, &mut self.sockets);

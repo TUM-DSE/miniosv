@@ -16,15 +16,18 @@ export CFLAGS_x86_64_unknown_linux_gnu = $(ring-cflags)
 export CFLAGS_aarch64_unknown_linux_gnu = $(ring-cflags)
 
 
-# Cargo features; test/Makefile adds selftest.
+# Cargo features; test/Makefile adds selftest. extra-root also wants mininet-extra-root, a CA certificate (DER) to
+# trust besides the compiled-in roots.
 mininet-features ?=
+mininet-extra-root ?=
 
 mininet_cargo_dir = $(out)/mininet-objs/cargo
 mininet_lib = $(mininet_cargo_dir)/release/libmininet.a
 
 .PHONY: $(mininet_lib)
 $(mininet_lib):
-	$(call quiet, cargo build --release --manifest-path $(mininet-dir)/rust/Cargo.toml \
+	$(call quiet, MININET_EXTRA_ROOT=$(abspath $(mininet-extra-root)) \
+		cargo build --release --manifest-path $(mininet-dir)/rust/Cargo.toml \
 		--features "$(mininet-features)" --target-dir $(mininet_cargo_dir), CARGO $(mininet-dir)/rust)
 
 $(out)/mininet-objs/mininet.o: $(mininet_lib)

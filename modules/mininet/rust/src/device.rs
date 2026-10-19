@@ -48,6 +48,8 @@ pub(crate) struct DpdkDevice {
     rx_jumbo_bytes: u64,
     rx_len_max: u16,
     rx_seen: u32,
+    /// Frames `receive` may still hand out in this poll; the worker refills it before each one.
+    pub(crate) rx_budget: u32,
     /// Frames written but not yet handed to the NIC: one doorbell per flush, not per frame.
     tx_handles: [*mut c_void; TX_BATCH],
     tx_lens: [u16; TX_BATCH],
@@ -79,6 +81,7 @@ impl DpdkDevice {
             rx_jumbo_bytes: 0,
             rx_len_max: 0,
             rx_seen: 0,
+            rx_budget: u32::MAX,
             tx_handles: [ptr::null_mut(); TX_BATCH],
             tx_lens: [0; TX_BATCH],
             tx_len: 0,
@@ -251,6 +254,11 @@ impl Device for DpdkDevice {
         if let Some(buf) = self.pending_synth.take() {
             return Some((DpdkRxToken::Synth(buf), DpdkTxToken { dev: self }));
         }
+        // smoltcp drains every received frame before it sends anything; under load that holds the ACKs back for
+        // milliseconds. The rest stay prefetched for the next poll.
+        if self.rx_budget == 0 {
+            return None;
+        }
         loop {
             if self.rx_pref_pos == self.rx_pref_len {
                 let got = unsafe {
@@ -290,6 +298,7 @@ impl Device for DpdkDevice {
 
             let ok = self.accepts(unsafe { core::slice::from_raw_parts(data, len) });
             if ok {
+                self.rx_budget -= 1;
                 return Some((DpdkRxToken::Mbuf { handle, data, len }, DpdkTxToken { dev: self }));
             }
             unsafe { shim_mbuf_free(handle) };
