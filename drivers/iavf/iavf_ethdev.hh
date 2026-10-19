@@ -35,6 +35,8 @@ public:
 	int rss_reta_update(rte_eth_rss_reta_entry64 *reta, uint16_t reta_size) override;
 	int rss_reta_query(rte_eth_rss_reta_entry64 *reta, uint16_t reta_size) override;
 	int rss_hash_conf_get(rte_eth_rss_conf *rss_conf) override;
+	int rx_intr_enable(uint16_t qid) override;
+	int rx_intr_disable(uint16_t qid) override;
 
 	iavf_adapter *adapter;
 	pci::device *pdev = nullptr;

@@ -961,8 +961,7 @@ static int ena_queue_start(struct rte_eth_dev *dev, ena_ring *ring) {
   if (ring->type == ENA_RING_TYPE_TX) {
     ring->tx_stats.available_desc = ena_com_free_q_entries(ring->ena_com_io_sq);
     return 0;
-  } else if (dev->data.dev_conf.intr_conf.rxq) {
-    assert(ring->handler);
+  } else if (dev->data.dev_conf.intr_conf.rxq && ring->handler) {
     ring->should_stop.store(false, std::memory_order_release);
     ring->intr_thread = sched::thread::make(
         [ring, dev]() { ena_rx_cleanup(ring, dev, ring->handler); });
@@ -1947,6 +1946,21 @@ err_start_tx:
   return rc;
 }
 
+/* The queue's interrupt stays masked after it fires until it is unmasked again, so arming is unmasking and a polled
+ * queue needs nothing to disarm. */
+int ena_eth_dev::rx_intr_enable(uint16_t qid) {
+  if (!data.dev_conf.intr_conf.rxq || qid >= data.nb_rx_queues)
+    return -ENOTSUP;
+  ena_rx_queue_intr_set(&get<ena_adapter>()->rx_ring[qid], true);
+  return 0;
+}
+
+int ena_eth_dev::rx_intr_disable(uint16_t qid) {
+  if (!data.dev_conf.intr_conf.rxq || qid >= data.nb_rx_queues)
+    return -ENOTSUP;
+  return 0;
+}
+
 int ena_eth_dev::stop() {
   ena_adapter *adapter = get<ena_adapter>();
   ena_com_dev *ena_dev = &adapter->ena_dev;
@@ -2699,12 +2713,15 @@ static int ena_enable_msix(ena_adapter *adapter) {
   return (0);
 }
 
+/* A callback queue wakes the driver's thread; a polled one wakes whoever armed it (rx_intr_enable). */
 static void ena_handle_msix(ena_ring *rx_ring) {
   rx_ring->interrupts++;
   rx_ring->rx_pkts_ready.store(true, std::memory_order_release);
   auto *t = rx_ring->intr_thread;
   if (t)
     t->wake_with_irq_disabled();
+  else
+    rx_ring->adapter->edev->rx_wake(rx_ring->id);
 }
 
 static int ena_request_io_irq(struct ena_adapter *adapter) {

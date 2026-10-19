@@ -509,17 +509,21 @@ iavf_dev_rx_queue_intr_disable(struct rte_eth_dev *dev, uint16_t queue_id)
 		return -EIO;
 	}
 
+	/* Polled from here on: descriptors are written back when the ITR expires, 2 units (4 us) as in polling mode. */
 	IAVF_WRITE_REG(hw,
 		      IAVF_VFINT_DYN_CTLN1(msix_intr - IAVF_RX_VEC_START),
-		      IAVF_VFINT_DYN_CTLN1_WB_ON_ITR_MASK);
+		      IAVF_VFINT_DYN_CTLN1_WB_ON_ITR_MASK |
+		      (0 << IAVF_VFINT_DYN_CTLN1_ITR_INDX_SHIFT) |
+		      (2UL << IAVF_VFINT_DYN_CTLN1_INTERVAL_SHIFT));
 
 	IAVF_WRITE_FLUSH(hw);
 	return 0;
 }
 
 /*
- * Interrupt-mode receive, as the ENA driver does it: the queue's vector masks itself and wakes a thread, which
- * drains the ring into the application's callback and then re-arms the vector.
+ * Rx interrupts. A queue's vector fires once and stays masked until re-enabled. In callback mode (a handler given
+ * at rx_queue_setup) it wakes the driver's thread, which drains the ring into the callback and re-arms, as ENA does.
+ * Otherwise the queue's owner polls it and arms the interrupt to sleep (rx_intr_enable): the vector calls its waker.
  */
 static void
 iavf_rxq_intr_loop(struct rte_eth_dev *dev, uint16_t qid)
@@ -573,14 +577,18 @@ iavf_rxq_intr_start(struct rte_eth_dev *dev)
 		std::vector<struct ci_rx_queue *> queues;
 		for (uint16_t q = 0; q < dev->data.nb_rx_queues; q++) {
 			auto *rxq = (struct ci_rx_queue *)dev->data.rx_queues[q];
-			if (vf->qv_map[q].vector_id == vector && rxq->intr)
+			if (vf->qv_map[q].vector_id == vector)
 				queues.push_back(rxq);
 		}
-		msi.assign_isr(vecs[v], [queues] {
+		msi.assign_isr(vecs[v], [dev, queues] {
 			for (auto *rxq : queues) {
-				rxq->intr->interrupts++;
-				rxq->intr->ready.store(true, std::memory_order_release);
-				rxq->intr->thread->wake_with_irq_disabled();
+				if (rxq->intr) {
+					rxq->intr->interrupts++;
+					rxq->intr->ready.store(true, std::memory_order_release);
+					rxq->intr->thread->wake_with_irq_disabled();
+				} else {
+					dev->rx_wake(rxq->queue_id);
+				}
 			}
 		});
 		msi.setup_entry(vector, vecs[v]);
@@ -599,9 +607,13 @@ iavf_rxq_intr_start(struct rte_eth_dev *dev)
 		rxq->intr->thread->start();
 	}
 	msi.unmask_interrupts(vecs);
-	for (uint16_t q = 0; q < dev->data.nb_rx_queues; q++)
+	/* Callback queues start armed; the others are polled until their owner arms them. */
+	for (uint16_t q = 0; q < dev->data.nb_rx_queues; q++) {
 		if (((struct ci_rx_queue *)dev->data.rx_queues[q])->intr)
 			iavf_dev_rx_queue_intr_enable(dev, q);
+		else
+			iavf_dev_rx_queue_intr_disable(dev, q);
+	}
 	return 0;
 }
 
@@ -1478,6 +1490,20 @@ int iavf_eth_dev::rss_reta_query(rte_eth_rss_reta_entry64 *reta, uint16_t reta_s
 int iavf_eth_dev::rss_hash_conf_get(rte_eth_rss_conf *rss_conf)
 {
 	return iavf_dev_rss_hash_conf_get(this, rss_conf);
+}
+
+int iavf_eth_dev::rx_intr_enable(uint16_t qid)
+{
+	if (!data.dev_conf.intr_conf.rxq || adapter->vf.msix_base != IAVF_RX_VEC_START || qid >= data.nb_rx_queues)
+		return -ENOTSUP;
+	return iavf_dev_rx_queue_intr_enable(this, qid);
+}
+
+int iavf_eth_dev::rx_intr_disable(uint16_t qid)
+{
+	if (!data.dev_conf.intr_conf.rxq || adapter->vf.msix_base != IAVF_RX_VEC_START || qid >= data.nb_rx_queues)
+		return -ENOTSUP;
+	return iavf_dev_rx_queue_intr_disable(this, qid);
 }
 
 bool

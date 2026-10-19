@@ -8,6 +8,7 @@
 #include <minidpdk/net.hh>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <features.h>
 #include <osv/types.h>
 #include <vector>
@@ -153,6 +154,8 @@ struct rte_eth_dev_data {
   std::vector<enum queue_state> tx_queue_state;
   std::vector<void *> tx_queues;
   std::vector<void *> rx_queues;
+  // Called from the queue's interrupt while rx_intr_enable() has it armed: whoever polls the queue sleeps on it.
+  std::vector<std::function<void()>> rx_wakers;
   rte_ether_addr mac_addr;
 
   rte_eth_dev_data(void *data) : data(data) {}
@@ -183,6 +186,15 @@ struct rte_eth_dev {
   rx_burst_t rx_burst;
   virtual int drv_configure() = 0;
   virtual void get_stats(rte_eth_stats *stats) = 0;
+  // With intr_conf.rxq set at configure, each Rx queue has an interrupt: armed, the next packet calls the queue's
+  // waker once; disarmed, the queue is polled. Drivers that cannot say -ENOTSUP.
+  virtual int rx_intr_enable(uint16_t qid) { (void)qid; return -ENOTSUP; }
+  virtual int rx_intr_disable(uint16_t qid) { (void)qid; return -ENOTSUP; }
+  // For the driver's interrupt handler.
+  void rx_wake(uint16_t qid) {
+    if (qid < data.rx_wakers.size() && data.rx_wakers[qid])
+      data.rx_wakers[qid]();
+  }
   int dev_configure(uint16_t nb_rx, uint16_t nb_tx, rte_eth_conf *conf) {
     data.nb_rx_queues = nb_rx;
     data.nb_tx_queues = nb_tx;
@@ -194,6 +206,7 @@ struct rte_eth_dev {
     data.rx_queues.resize(nb_rx, nullptr);
     data.tx_queue_state.resize(nb_tx, RTE_ETH_QUEUE_STATE_STOPPED);
     data.rx_queue_state.resize(nb_rx, RTE_ETH_QUEUE_STATE_STOPPED);
+    data.rx_wakers.resize(nb_rx);
     return drv_configure();
   }
   virtual int get_dev_info(rte_eth_dev_info *info) = 0;
@@ -270,6 +283,21 @@ __inline int rte_eth_tx_queue_setup(uint16_t port, uint16_t qid,
                                     rte_eth_txconf *tx_conf) {
   return eth_os::get_eth_for_port(port)->tx_queue_setup(qid, nb_txd, socket_id,
                                                         tx_conf);
+}
+
+// DPDK's Rx interrupt calls; the waker stands in for its epoll file descriptor. Set the waker before arming.
+__inline int rte_eth_dev_rx_intr_enable(uint16_t port, uint16_t qid) {
+  return eth_os::get_eth_for_port(port)->rx_intr_enable(qid);
+}
+
+__inline int rte_eth_dev_rx_intr_disable(uint16_t port, uint16_t qid) {
+  return eth_os::get_eth_for_port(port)->rx_intr_disable(qid);
+}
+
+__inline void rte_eth_dev_rx_intr_waker(uint16_t port, uint16_t qid, std::function<void()> waker) {
+  auto *dev = eth_os::get_eth_for_port(port);
+  if (qid < dev->data.rx_wakers.size())
+    dev->data.rx_wakers[qid] = std::move(waker);
 }
 
 __inline int rte_eth_dev_start(uint16_t port){
