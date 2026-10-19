@@ -743,6 +743,9 @@ iavf_dev_info_get(struct rte_eth_dev *dev, struct rte_eth_dev_info *dev_info)
 
 	if (vf->vf_res->vf_cap_flags & VIRTCHNL_VF_LARGE_NUM_QPAIRS)
 		max_queue_pairs = IAVF_MAX_NUM_QUEUES_LV;
+	/* What the VF holds is only what was last asked for; configure asks the PF for more. */
+	else if (vf->vf_res->vf_cap_flags & VIRTCHNL_VF_OFFLOAD_REQ_QUEUES)
+		max_queue_pairs = IAVF_MAX_NUM_QUEUES_DFLT;
 	else
 		max_queue_pairs = RTE_MIN(vf->vsi_res->num_queue_pairs,
 					  IAVF_MAX_NUM_QUEUES_DFLT);
@@ -1164,12 +1167,18 @@ iavf_dev_interrupt_handler(void *param)
 {
 	struct rte_eth_dev *dev = (struct rte_eth_dev *)param;
 	struct iavf_hw *hw = IAVF_DEV_PRIVATE_TO_HW(dev->data.data);
+	struct iavf_info *vf = IAVF_DEV_PRIVATE_TO_VF(dev->data.data);
+
+	/* A reinit polls the mailbox itself: reading it here, or turning the vector back on, takes its replies. */
+	if (!vf->aq_intr_enabled)
+		return;
 
 	iavf_disable_irq0(hw);
 
 	iavf_handle_virtchnl_msg(dev);
 
-	iavf_enable_irq0(hw);
+	if (vf->aq_intr_enabled)
+		iavf_enable_irq0(hw);
 }
 
 static void
@@ -1262,8 +1271,8 @@ iavf_reinit(struct rte_eth_dev *dev)
 		PMD_INIT_LOG(ERR, "Init vf failed after reset");
 		return -1;
 	}
-	iavf_enable_irq0(hw);
 	vf->aq_intr_enabled = true;
+	iavf_enable_irq0(hw);
 	iavf_set_no_poll(adapter, false);
 	return 0;
 }
@@ -1379,9 +1388,9 @@ iavf_dev_init(iavf_eth_dev *eth_dev)
 	if (iavf_setup_misc_vector(eth_dev) != 0)
 		goto init_vf_err;
 
-	/* configure and enable device interrupt */
-	iavf_enable_irq0(hw);
+	/* configure and enable device interrupt; the flag first, or a handler in between leaves the vector masked */
 	vf->aq_intr_enabled = true;
+	iavf_enable_irq0(hw);
 
 	iavf_default_rss_disable(adapter);
 
