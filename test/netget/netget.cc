@@ -7,7 +7,10 @@
  *   4. the stack's counters.
  *
  * Boot arguments (run.py --args) override the NETGET_* defaults: workers= conns= threads= req_kb= seconds=
- * check_mb= path= host= tls=. tls=1 dials 443 and checks the server's certificate against host.
+ * check_mb= path= host= tls= idle_us= compute= lead_ms= think_us=. tls=1 dials 443 and checks the server's certificate
+ * against host. idle_us is mininet's idle window (0: workers poll forever). compute=N runs N threads of CPU work
+ * beside the timed phase, standing in for query processing, started lead_ms before it; think_us pauses each
+ * fetching thread between requests.
  */
 
 #include <algorithm>
@@ -61,6 +64,10 @@ static struct {
 	uint64_t req_kb = NETGET_REQ_KB;
 	unsigned check_mb = NETGET_CHECK_MB;
 	unsigned seconds = NETGET_SECONDS;
+	unsigned idle_us = 0;
+	unsigned compute = 0;
+	unsigned lead_ms = 0;
+	unsigned think_us = 0;
 } opt;
 
 static void parse_args()
@@ -88,10 +95,20 @@ static void parse_args()
 			opt.check_mb = std::stoul(v);
 		else if (k == "seconds")
 			opt.seconds = std::stoul(v);
+		else if (k == "idle_us")
+			opt.idle_us = std::stoul(v);
+		else if (k == "compute")
+			opt.compute = std::stoul(v);
+		else if (k == "think_us")
+			opt.think_us = std::stoul(v);
+		else if (k == "lead_ms")
+			opt.lead_ms = std::stoul(v);
 	}
 	printf("netget: %s://%s (%s) ", opt.tls ? "https" : "http", opt.host.c_str(), NETGET_SERVER);
-	printf("path %s workers %u conns %u threads %u req_kb %" PRIu64 " check_mb %u seconds %u\n",
-	       opt.path.c_str(), opt.workers, opt.conns, opt.threads, opt.req_kb, opt.check_mb, opt.seconds);
+	printf("path %s workers %u conns %u threads %u req_kb %" PRIu64 " check_mb %u seconds %u idle_us %u compute %u "
+	       "think_us %u\n",
+	       opt.path.c_str(), opt.workers, opt.conns, opt.threads, opt.req_kb, opt.check_mb, opt.seconds, opt.idle_us,
+	       opt.compute, opt.think_us);
 }
 
 static int range_get(uint64_t first, uint64_t len, void *buf, mininet::response *r)
@@ -122,6 +139,7 @@ static int run()
 	c.tls = opt.tls;
 	c.workers = opt.workers;
 	c.conns_per_worker = opt.conns;
+	c.idle_us = opt.idle_us;
 	auto t0 = clock::now();
 	int rc = mininet::up(c);
 	printf("netget: up %s in %.0f ms\n", mininet::strerror(rc),
@@ -160,6 +178,22 @@ static int run()
 	std::atomic<bool> stop{false};
 	std::vector<std::thread> threads;
 	std::vector<std::vector<uint32_t>> lat_us(opt.threads);
+	// Query processing stand-in: a hash over a private 256 KiB block, counted in blocks.
+	std::atomic<uint64_t> blocks{0};
+	std::vector<std::thread> workers;
+	for (unsigned t = 0; t < opt.compute; t++) {
+		workers.emplace_back([&] {
+			std::vector<uint8_t> b(256 << 10, 0x5a);
+			uint64_t h = 0xcbf29ce484222325ULL, n = 0;
+			while (!stop.load(std::memory_order_relaxed)) {
+				h = fnv1a(h, b.data(), b.size());
+				b[n++ % b.size()] = (uint8_t)h;
+			}
+			blocks += n;
+		});
+	}
+	auto tc0 = clock::now();
+	std::this_thread::sleep_for(std::chrono::milliseconds(opt.lead_ms));
 	t0 = clock::now();
 	for (unsigned t = 0; t < opt.threads; t++) {
 		threads.emplace_back([&, t] {
@@ -175,6 +209,8 @@ static int run()
 				lat_us[t].push_back(std::chrono::duration_cast<std::chrono::microseconds>(clock::now() - a).count());
 				bytes += rr.bytes;
 				reqs++;
+				if (opt.think_us)
+					std::this_thread::sleep_for(std::chrono::microseconds(opt.think_us));
 			}
 		});
 	}
@@ -182,7 +218,14 @@ static int run()
 	stop = true;
 	for (auto &t : threads)
 		t.join();
+	for (auto &t : workers)
+		t.join();
 	s = std::chrono::duration<double>(clock::now() - t0).count();
+	if (opt.compute) {
+		double sc = std::chrono::duration<double>(clock::now() - tc0).count();
+		printf("netget: compute %u threads: %.1f blocks/s (%.2f GB/s hashed)\n", opt.compute, blocks / sc,
+		       blocks * (256 << 10) / sc / 1e9);
+	}
 	printf("netget: %u threads x %" PRIu64 " KiB: %" PRIu64 " requests, %" PRIu64 " errors, %.2f GB in %.2f s = %.2f Gbit/s\n",
 	       opt.threads, opt.req_kb, reqs.load(), errors.load(), bytes / 1e9, s, bytes * 8 / s / 1e9);
 
@@ -204,6 +247,8 @@ static int run()
 		for (auto b : bins)
 			printf(" %u", b);
 		printf("\n");
+		auto over = [&](uint32_t us) { return all.end() - std::upper_bound(all.begin(), all.end(), us); };
+		printf("netget: stalls: %td over 200 ms, %td over 900 ms\n", over(200000), over(900000));
 	}
 
 	auto st = mininet::stats();
@@ -217,6 +262,8 @@ static int run()
 	       " us; retried %" PRIu64 "\n",
 	       st.setup.n, st.setup.us_avg, st.setup.us_p50, st.setup.us_p90, st.setup.us_max, st.dial.n, st.dial.us_avg,
 	       st.dial.us_p50, st.dial.us_p90, st.dial.us_max, st.requests_retried);
+	printf("netget: idle sleeps %" PRIu64 " (%" PRIu64 " ended by a packet or request), asleep %.1f%% of workers' time\n",
+	       st.idle_sleeps, st.idle_signalled, s > 0 ? 100.0 * st.idle_ns_total / 1e9 / s / opt.workers : 0.0);
 	auto avg_us = [](uint64_t ns, uint64_t n) { return n ? ns / 1e3 / n : 0.0; };
 	printf("netget: per request (us): queue %.0f wire %.0f ttfb %.0f xfer %.0f get %.0f wake %.0f (max %.0f)\n",
 	       avg_us(st.queue_ns_total, st.requests_done), avg_us(st.wire_ns_total, st.requests_done),
