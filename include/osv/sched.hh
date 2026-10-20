@@ -1011,6 +1011,9 @@ struct cpu : private timer_base::client {
     // true while the idle thread runs here, so a waker can send its thread elsewhere
     std::atomic<bool> idling = { false };
     std::atomic<uint64_t> tlb_ipis = { 0 };
+    // the real-time priority of the thread running here (0: an ordinary
+    // one), for a waker to see whether its thread must interrupt this cpu
+    std::atomic<unsigned> running_rt_priority = { 0 };
     // for each cpu, a list of threads that are migrating into this cpu:
     typedef lockless_queue<thread, &thread::_wakeup_link> incoming_wakeup_queue;
     cpu_set incoming_wakeups_mask;
@@ -1028,7 +1031,9 @@ struct cpu : private timer_base::client {
     void do_idle();
     void idle_poll_start();
     void idle_poll_end();
-    void send_wakeup_ipi();
+    // `force`: interrupt the cpu even when its run queue suggests it will
+    // reschedule soon by itself -- a running real-time thread never does.
+    void send_wakeup_ipi(bool force = false);
     void on_cpu_up();
     unsigned load();
     /**

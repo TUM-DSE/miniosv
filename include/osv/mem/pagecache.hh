@@ -113,6 +113,10 @@ bool set_limit(void *addr, size_t bytes);
 // Ensures the buffers overlapping with the range are mapped.
 size_t fetch(void *addr, size_t bytes);
 
+// Starts reading the buffers of the range that are neither mapped nor being
+// read, without waiting for them; the bytes whose reads were started.
+size_t prefetch(void *addr, size_t bytes);
+
 // Statistics
 void stats_dump();
 void stats_reset();

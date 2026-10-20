@@ -20,7 +20,9 @@
 #include <algorithm>
 #include <chrono>
 #include <climits>
+#include <cstdio>
 #include <map>
+#include <string>
 
 #include "include/lros.hh"
 #include "internal.hh"
@@ -341,7 +343,10 @@ void schedule()
         }
     }
 
-    // A task on cores a worse priority still runs on outranks it there.
+    // A task on cores a worse priority still runs on outranks it there. The
+    // worse one stops computing from this moment -- its thread there is
+    // descheduled and its others wait at the next barrier -- so the engine
+    // hears it has no cores, until it takes its next assignment.
     for (task *t : runnable) {
         cpu_mask worse = 0;
         for (task *o : runnable) {
@@ -351,6 +356,14 @@ void schedule()
         }
         const cpu_mask mine = t->current.cpus | t->next.cpus;
         t->rt_prio = preempt_in_iteration && (mine & worse) ? rt_of(t->prio) : 0;
+        if (t->rt_prio && ops.width_changed) {
+            for (task *o : runnable) {
+                if (o->prio > t->prio && (o->current.cpus & mine) && o->logged_width != 0) {
+                    o->logged_width = 0;
+                    ops.width_changed(*o, 0);
+                }
+            }
+        }
     }
     for (task *t : started) {
         worker_start(t);
@@ -441,6 +454,7 @@ int32_t submit(request *r)
     t->t_decided = t->decision_lag_ns = 0;
     t->paused_ns = t->t_paused_since = 0;
     t->n_preemptions = 0;
+    t->logged_width = -1;
     t->on_device = false;
     t->rt_prio = 0;
     t->kv_charged = 0;
@@ -630,6 +644,79 @@ void wait_all()
             all_done.wait(lock);
         }
     }
+}
+
+std::atomic<uint64_t> iterations_done{0};
+
+void yield_briefly()
+{
+    sched::thread::sleep(std::chrono::microseconds(20));
+}
+
+void watchdog_start(uint32_t stall_seconds)
+{
+    auto *th = sched::thread::make([stall_seconds] {
+        uint64_t last = iterations_done.load(std::memory_order_relaxed);
+        uint32_t quiet = 0;
+        for (;;) {
+            sched::thread::sleep(std::chrono::seconds(1));
+            const uint64_t now = iterations_done.load(std::memory_order_relaxed);
+            if (now != last) {
+                last = now;
+                quiet = 0;
+                continue;
+            }
+            if (++quiet == stall_seconds) {
+                printf("lros: watchdog: no iteration completed for %u s\n", stall_seconds);
+                dump_tasks();
+            }
+        }
+    }, sched::thread::attr().detached().name("lros:watchdog"));
+    // Above the arrival thread and every worker, so that a core full of
+    // real-time spinners still lets it run for its one look per second.
+    th->set_realtime_priority(rt_arrival + 1);
+    th->start();
+}
+
+void dump_tasks()
+{
+    // Without blocking: at a hang the lock may be held by the very thread
+    // that cannot run, and that is worth a line of its own.
+    if (!lock.try_lock()) {
+        printf("lros: the scheduler lock is held; tasks not listed\n");
+    } else {
+        printf("lros: %zu task(s), usable cores %llx\n", tasks.size(),
+               (unsigned long long) usable_cpus);
+        for (task *t : tasks) {
+            const char *st = t->state == task_state::queued ? "queued" :
+                             t->state == task_state::running ? "running" :
+                             t->state == task_state::paused ? "paused" : "done";
+            printf("lros:   task %d prio %d %s cur %llx next %llx wanted %d rt %u "
+                   "iters %u members %zu pending %zu phase %s decided %s\n",
+                   t->id, t->prio, st, (unsigned long long) t->current.cpus,
+                   (unsigned long long) t->next.cpus, t->wanted, t->rt_prio,
+                   t->n_iterations, t->members.size(), t->pending_members.size(),
+                   t->ph == phase::prefill ? "prefill" : "decode",
+                   t->t_decided ? "pending" : "applied");
+        }
+        lock.unlock();
+    }
+    sched::with_all_threads([](sched::thread &th) {
+        const std::string name = th.name();
+        if (name.compare(0, 5, "lros:") != 0) {
+            return;
+        }
+        const char *st;
+        switch (th.get_status()) {
+            case sched::thread::status::running:  st = "running"; break;
+            case sched::thread::status::queued:   st = "queued"; break;
+            case sched::thread::status::waiting:  st = "waiting"; break;
+            case sched::thread::status::waking:   st = "waking"; break;
+            default:                              st = "other"; break;
+        }
+        printf("lros:   thread %-12s cpu %u %-8s rt %u\n", name.c_str(),
+               th.tcpu() ? th.tcpu()->id : 99u, st, th.realtime_priority());
+    });
 }
 
 occupancy get_occupancy()

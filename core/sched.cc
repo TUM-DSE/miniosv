@@ -371,6 +371,7 @@ void cpu::reschedule_from_interrupt(bool called_from_yield,
     trace_sched_load(runqueue.size());
 
     n->_detached_state->st.store(thread::status::running);
+    running_rt_priority.store(n->_realtime._priority, std::memory_order_relaxed);
     n->_runtime.hysteresis_run_start();
 
     assert(n!=p);
@@ -457,10 +458,11 @@ void cpu::idle_poll_end()
 }
 
 // Ungated on runqueue length: a busy cpu would leave the wake to the preemption timer.
-void cpu::send_wakeup_ipi()
+// force: a real-time thread running there has no timer and reschedules only when it blocks.
+void cpu::send_wakeup_ipi(bool force)
 {
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    if (!idle_poll.load(std::memory_order_relaxed)) {
+    if (force || !idle_poll.load(std::memory_order_relaxed)) {
         trace_sched_ipi(id);
         wakeup_ipi.send(this);
     }
@@ -976,6 +978,10 @@ float thread::priority() const
 void thread::set_realtime_priority(unsigned priority)
 {
     _realtime._priority = priority;
+    // A running thread changing its own: keep its cpu's record current.
+    if (this == current()) {
+        tcpu()->running_rt_priority.store(priority, std::memory_order_relaxed);
+    }
 }
 
 unsigned thread::realtime_priority() const
@@ -1353,11 +1359,18 @@ void thread::wake_impl(detached_state* st, unsigned allowed_initial_states_mask)
         WITH_LOCK(irq_lock) {
             tcpu->incoming_wakeups[c].push_back(*st->t);
         }
-        if (!tcpu->incoming_wakeups_mask.test_all_and_set(c)) {
+        // A real-time thread woken onto a cpu running a real-time thread of
+        // lower priority must preempt it at once: that thread has no
+        // preemption timer and reschedules only when it blocks, so the cpu
+        // is interrupted whatever its run queue and pending wake-ups say.
+        const unsigned rt = st->t->_realtime._priority;
+        const unsigned running_rt = tcpu->running_rt_priority.load(std::memory_order_relaxed);
+        const bool urgent = rt > 0 && running_rt > 0 && running_rt < rt;
+        if (!tcpu->incoming_wakeups_mask.test_all_and_set(c) || urgent) {
             // FIXME: avoid if the cpu is alive and if the priority does not
             // FIXME: warrant an interruption
             if (tcpu != current()->tcpu()) {
-                tcpu->send_wakeup_ipi();
+                tcpu->send_wakeup_ipi(urgent);
             } else {
                 need_reschedule = true;
             }

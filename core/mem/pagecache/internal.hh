@@ -67,7 +67,7 @@ struct buffer {
 };
 
 // Prefetch claims waiting to be installed.
-constexpr unsigned pending_slots = 64;
+constexpr unsigned pending_slots = 256;
 
 struct cache {
     vspace::region r;

@@ -77,15 +77,19 @@ exits.
 Executables: `llama-cli`, `batched-bench`, `lros-serve`. All `exit()` when done, which powers the
 VM off.
 
+miniOSv has no load balancer, so a thread stays on the core it starts on. ggml's own threads must
+be pinned with `-C <mask> --cpu-strict 1`, one bit per vcpu (`f` for the default `-c 4`, `ff` for
+`-c 8`), or they all run on one core. `--lros` and `lros-serve --mode lros` pin their own workers.
+
 ```bash
 make app=app/llama.cpp
 MODEL=$(app/llama.cpp/miniosv/get-model.sh llama-3.2-1b-q8)   # --list for the others
 
 scripts/run.py -m 6G --emulated-nvme "$MODEL" \
-    --args "llama-cli -m nvme:1 -no-cnv -p 'The capital of France is' -n 32 -t 4"
+    --args "llama-cli -m nvme:1 -no-cnv -p 'The capital of France is' -n 32 -t 4 -C f --cpu-strict 1"
 
 scripts/run.py -m 6G --emulated-nvme "$MODEL" \
-    --args "batched-bench -m nvme:1 -c 2048 -npp 16,32 -ntg 128,256 -npl 1,4 -t 4"
+    --args "batched-bench -m nvme:1 -c 2048 -npp 16,32 -ntg 128,256 -npl 1,4 -t 4 -C f --cpu-strict 1"
 ```
 
 The model can equally live on an ext4 image (`mkdata.sh` with a staging dir holding `models/`),
@@ -217,7 +221,7 @@ Matmul offload to a host accelerator, built in by default (`conf_vaccel=0` for a
 make app=app/llama.cpp arch=aarch64 conf_vaccel=1
 scripts/run.py --arch aarch64 --vaccel -m 6G \
     --emulated-nvme build/data.img --emulated-nvme "$MODEL" \
-    --args "llama-cli -m nvme:2 -no-cnv -p 'What is a combustion engine' -n 32 -t 4"
+    --args "llama-cli -m nvme:2 -no-cnv -p 'What is a combustion engine' -n 32 -t 4 -C f --cpu-strict 1"
 ```
 
 Needs the QEMU from the `lros-qemu` flake (`nix develop` sets `$QEMU_VACCEL`) and

@@ -14,6 +14,7 @@ import argparse
 import os
 import errno
 import shutil
+import signal
 import tempfile
 
 devnull = open('/dev/null', 'w')
@@ -153,6 +154,8 @@ def start_osv_qemu(options):
             drive = "file=%s,if=none,id=nvm%d,format=raw" % (image, i)
             if options.nvme_cache is not None:
                 drive += ",cache=%s" % options.nvme_cache
+            if options.nvme_aio is not None:
+                drive += ",aio=%s" % options.nvme_aio
             args += ["-drive", drive, "-device", dev]
 
         # vAccel offload: the guest reaches a host accelerator through this
@@ -235,6 +238,13 @@ def main(options):
     if options.hypervisor not in ("tcg", "kvm"):
         sys.exit("Unrecognized hypervisor '%s' (expected kvm or tcg)."
                  % options.hypervisor)
+    # A harness that gives up on a run sends SIGTERM (timeout(1), kill). The
+    # default disposition would end this process without unwinding, leaving
+    # the 128 MiB firmware copy behind in the temp dir (a tmpfs on some hosts)
+    # and the qemu child to whoever else signals it. Turning it into an
+    # exception lets subprocess kill qemu and the finally clause remove the
+    # temp dir.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(128 + signal.SIGTERM))
     start_osv_qemu(options)
 
 if __name__ == "__main__":
@@ -276,6 +286,10 @@ if __name__ == "__main__":
                         help="MDTS for the emulated data drives: one command "
                              "carries 4 KiB << this, so 7 is 512 KiB and 9 is "
                              "2 MiB. QEMU's own default is 7.")
+    parser.add_argument("--nvme-aio", action="store", default=None,
+                        choices=["threads", "native", "io_uring"],
+                        help="QEMU aio backend for the emulated data drives; native "
+                             "and io_uring need --nvme-cache none")
     parser.add_argument("--nvme-cache", action="store", default=None,
                         choices=["none", "writeback", "writethrough", "directsync", "unsafe"],
                         help="QEMU cache mode for the emulated data drives. The "

@@ -55,7 +55,9 @@ device *open(int nvme_id, int *err)
     d->lba_size = d->dev.lba_size();
     d->bytes = d->dev.lba_count() * static_cast<uint64_t>(d->lba_size);
 
-    constexpr size_t prp_limit = 511 * NVME_PAGESIZE;
+    // The driver builds one PRP list page per command: prp1 plus 512 list
+    // entries, so 512 pages for the page-aligned buffers the cache hands us.
+    constexpr size_t prp_limit = 512 * NVME_PAGESIZE;
     auto *drv = nvme::nvme_driver::get_nvme_device(nvme_id);
     const size_t mdts = drv ? drv->max_transfer_bytes() : 0;
     d->max_transfer = (mdts && mdts < prp_limit) ? mdts : prp_limit;

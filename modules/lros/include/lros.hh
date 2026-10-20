@@ -110,6 +110,11 @@ struct task {
     uint64_t paused_ns;          // summed time held at zero cores
     uint64_t t_paused_since;     // 0 when running
     uint32_t n_preemptions;      // assignments that took every core away
+    // The cores last reported through engine_ops::width_changed: the count
+    // it computes on, 0 while paused, and 0 from the moment a better task
+    // takes one of its cores mid-iteration until it runs again. Under the
+    // lock.
+    int32_t  logged_width;
 
     // Memory. `kv_charged` is what this task's context costs while it exists;
     // the scheduler sets `kv_evict_asked` when it wants that back, and the
@@ -238,6 +243,12 @@ struct engine_ops {
     // 0..n-1 through run_on_workers(). Must update t.ph on a phase change.
     iter_result (*iterate)(task &t, const assignment &a);
 
+    // Optional: the number of cores a task computes on changed -- before an
+    // iteration whose assignment differs from the last, 0 when it pauses,
+    // and 0 when it is done. For the engine's log; the scheduler keeps no
+    // record of its assignments over time.
+    void (*width_changed)(const task &t, int32_t n_cpus) = nullptr;
+
     // A member finished; the engine releases its state.
     void (*finished)(task &t, request *r);
 
@@ -343,6 +354,22 @@ struct task_stats {
     uint64_t decision_lag_ns;   // total; divide by n_reassignments for the mean
 };
 size_t finished_tasks(task_stats *out, size_t max);
+
+// Prints every task (state, cores, priority, iterations) and every lros
+// thread (core, status, real-time priority) to the console: what a watchdog
+// calls when nothing has completed for a while.
+void dump_tasks();
+
+// A real-time thread above every worker that dumps the tasks when no
+// iteration has completed for `stall_seconds`, once per stall. Above the
+// workers so that it runs even when they spin on every core.
+void watchdog_start(uint32_t stall_seconds);
+
+// Gives the calling core up for a few microseconds. What a compute
+// library's spin-wait calls now and then, so that a worker spinning at a
+// real-time priority cannot hold its core against a lower-priority thread
+// its peers are waiting for.
+void yield_briefly();
 
 // Worker lifecycle cost, accumulated: create+pin+start, and join.
 struct worker_stats {
