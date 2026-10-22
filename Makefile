@@ -607,14 +607,16 @@ endif
 #
 #   make                    -> app/, the placeholder app.cc
 #   make app=tests          -> the test suite in tests/
-#   make app=app/miniduckdb -> DuckDB    (submodule)
 #   make app=app/llama.cpp  -> llama.cpp (submodule)
 #   make app=<directory>    -> that directory, in the tree or out of it
 #
 # A directory is all an application is: its Makefile derives the rest of the
 # tree from its own path, so the same source builds in place or copied to app/.
 # The nix layer relies on the latter -- it stages an app source there and runs
-# plain `make`. A submodule needs 'git submodule update --init' first.
+# plain `make`. A submodule needs 'git submodule update --init' first. An app
+# can also own the build and keep this repository as its own submodule, which
+# is how miniduckdb does it -- its top-level Makefile calls this one with app=
+# set to its root.
 app ?= app
 include $(app)/Makefile
 objects += $(app-objects)

@@ -4,7 +4,7 @@ One application is linked into the kernel, so *which app* is a build-time choice
 program inside it* is a boot-time one:
 
 ```bash
-make app=app/miniduckdb              # -> build/release.x64/loader.img
+make app=app/llama.cpp               # -> build/release.x64/loader.img
 make app=app/llama.cpp arch=aarch64  # -> build/release.aarch64/loader.img
 ```
 
@@ -26,6 +26,10 @@ After an unclean shutdown the image needs `fsck.ext4 -f -y build/data.img` — t
 
 ## DuckDB: TPC-H
 
+DuckDB lives in [its own repository](https://github.com/TUM-DSE/miniduckdb), which keeps this one
+as a submodule under `kernel/`: `make` there builds `kernel/build/release.x64/loader.img`. The
+commands below run from that checkout, so the kernel's scripts are reached through `kernel/`.
+
 Executables: `duckdb` (upstream CLI), `benchmark` (upstream runner), `sql` (minimal `-d`/`-c`).
 
 ### Pre-generated parquet, any scale factor
@@ -36,12 +40,12 @@ benchmark group that queries them. Files are hardlinked into the staging tree wh
 same filesystem, so nothing is copied twice.
 
 ```bash
-make app=app/miniduckdb
-app/miniduckdb/miniosv/mk-tpch.sh --src [tpch_data_folder] --img [data_img] 1 10
+make
+miniosv/mk-tpch.sh --src [tpch_data_folder] --img [data_img] 1 10
 
-scripts/run.py --image-path build/duckdb.x64/loader.img -m 32G --emulated-nvme [data_img] \
+kernel/scripts/run.py -m 32G --emulated-nvme [data_img] \
     --args "benchmark --sf 10 benchmark/tpch-parquet/q06.benchmark"        # one query
-scripts/run.py --image-path build/duckdb.x64/loader.img -m 32G --emulated-nvme [data_img] \
+kernel/scripts/run.py -m 32G --emulated-nvme [data_img] \
     --args "benchmark --sf 10 'benchmark/tpch-parquet/q[0-9]+.benchmark'"  # all 22
 ```
 
@@ -56,8 +60,8 @@ unchecked.
 ### Generating in the guest instead
 
 ```bash
-scripts/mkdata.sh build/data.img
-scripts/run.py -m 6G --emulated-nvme build/data.img \
+kernel/scripts/mkdata.sh data.img
+kernel/scripts/run.py -m 6G --emulated-nvme data.img \
     --args "duckdb /db/tpch.duckdb -c 'CALL dbgen(sf=0.1)' -c 'PRAGMA tpch(1)'"
 ```
 

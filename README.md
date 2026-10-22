@@ -38,8 +38,10 @@ checks it reaches the kernel.
 
 The default app (`app/app.cc`) is a hello-world placeholder: it prints a greeting and then spins,
 so the boot output stays on the console. `app=` names the directory to link in instead:
-`make app=tests` for the larger test suite, `app=app/miniduckdb` or `app=app/llama.cpp` for the
-submodules, or any directory holding a Makefile that sets `$(app-objects)`.
+`make app=tests` for the larger test suite, `app=app/llama.cpp` for the submodule, or any
+directory holding a Makefile that sets `$(app-objects)`, in this tree or out of it. An app can
+also own the build: [miniduckdb](https://github.com/TUM-DSE/miniduckdb) keeps this repository as a
+submodule under `kernel/` and runs this Makefile with `app=` pointing back at itself.
 
 ## License
 
