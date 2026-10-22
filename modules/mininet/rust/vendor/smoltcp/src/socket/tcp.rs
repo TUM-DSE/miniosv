@@ -456,6 +456,10 @@ pub enum CongestionControl {
     Cubic,
 }
 
+/// mininet: takes in-order payload instead of the receive buffer; `true` if it did. Called with the context
+/// [`Socket::set_rx_direct`] was given.
+pub type RxDirect = fn(ctx: usize, payload: &[u8]) -> bool;
+
 /// A Transmission Control Protocol socket.
 ///
 /// A TCP socket may passively listen for connections or actively connect to another endpoint.
@@ -470,6 +474,9 @@ pub struct Socket<'a> {
     assembler: Assembler,
     rx_buffer: SocketBuffer<'a>,
     rx_fin_received: bool,
+    /// mininet: where in-order payload goes instead of `rx_buffer`, and the bytes it holds.
+    rx_direct: Option<(RxDirect, usize)>,
+    rx_held: usize,
     tx_buffer: SocketBuffer<'a>,
     /// Interval after which, if no inbound packets are received, the connection is aborted.
     timeout: Option<Duration>,
@@ -579,6 +586,8 @@ impl<'a> Socket<'a> {
             tx_buffer,
             rx_buffer,
             rx_fin_received: false,
+            rx_direct: None,
+            rx_held: 0,
             timeout: None,
             keep_alive: None,
             hop_limit: None,
@@ -746,7 +755,33 @@ impl<'a> Socket<'a> {
     /// Used in internal calculations as well as packet generation.
     #[inline]
     fn scaled_window(&self) -> u16 {
-        u16::try_from(self.rx_buffer.window() >> self.remote_win_shift).unwrap_or(u16::MAX)
+        u16::try_from(self.rx_window() >> self.remote_win_shift).unwrap_or(u16::MAX)
+    }
+
+    /// What the receive buffer could still take, less what [`RxDirect`] holds.
+    #[inline]
+    fn rx_window(&self) -> usize {
+        self.rx_buffer.window().saturating_sub(self.rx_held)
+    }
+
+    /// mininet: hand in-order payload to `direct` rather than the receive buffer, whenever it would land at the
+    /// front of an empty one. What `direct` takes counts against the window until [`Self::release_rx_held`].
+    pub fn set_rx_direct(&mut self, direct: Option<(RxDirect, usize)>) {
+        self.rx_direct = direct;
+    }
+
+    /// `n` bytes [`RxDirect`] took are done with: the window opens by as much.
+    pub fn release_rx_held(&mut self, n: usize) {
+        self.rx_held -= n.min(self.rx_held);
+    }
+
+    pub fn rx_held(&self) -> usize {
+        self.rx_held
+    }
+
+    /// The MSS the peer announced, or the default if it announced none.
+    pub fn remote_mss(&self) -> usize {
+        self.remote_mss
     }
 
     /// Return the last window field value, including scaling according to RFC 1323.
@@ -896,6 +931,8 @@ impl<'a> Socket<'a> {
         self.tx_buffer.clear();
         self.rx_buffer.clear();
         self.rx_fin_received = false;
+        self.rx_direct = None;
+        self.rx_held = 0;
         self.listen_endpoint = IpListenEndpoint::default();
         self.tuple = None;
         self.local_seq_no = TcpSeqNumber::default();
@@ -2138,27 +2175,39 @@ impl<'a> Socket<'a> {
 
         let assembler_was_empty = self.assembler.is_empty();
 
-        // Try adding payload octets to the assembler.
-        let Ok(contig_len) = self
-            .assembler
-            .add_then_remove_front(payload_offset, payload_len)
-        else {
-            net_debug!(
-                "assembler: too many holes to add {} octets at offset {}",
+        // In order, and nothing buffered ahead of it: as though enqueued and read at once, if `rx_direct` takes it.
+        let direct = payload_offset == 0
+            && assembler_was_empty
+            && self.rx_buffer.is_empty()
+            && self.rx_direct.is_some_and(|(f, ctx)| f(ctx, payload));
+        let contig_len = if direct {
+            self.remote_seq_no += payload_len;
+            self.rx_held += payload_len;
+            0
+        } else {
+            // Try adding payload octets to the assembler.
+            let Ok(contig_len) = self
+                .assembler
+                .add_then_remove_front(payload_offset, payload_len)
+            else {
+                net_debug!(
+                    "assembler: too many holes to add {} octets at offset {}",
+                    payload_len,
+                    payload_offset
+                );
+                return None;
+            };
+
+            // Place payload octets into the buffer.
+            tcp_trace!(
+                "rx buffer: receiving {} octets at offset {}",
                 payload_len,
                 payload_offset
             );
-            return None;
+            let len_written = self.rx_buffer.write_unallocated(payload_offset, payload);
+            debug_assert!(len_written == payload_len);
+            contig_len
         };
-
-        // Place payload octets into the buffer.
-        tcp_trace!(
-            "rx buffer: receiving {} octets at offset {}",
-            payload_len,
-            payload_offset
-        );
-        let len_written = self.rx_buffer.write_unallocated(payload_offset, payload);
-        debug_assert!(len_written == payload_len);
 
         if contig_len != 0 {
             // Enqueue the contiguous data octets in front of the buffer.
@@ -2494,7 +2543,7 @@ impl<'a> Socket<'a> {
                 repr.control = TcpControl::Syn;
                 repr.seq_number = self.local_seq_no;
                 // window len must NOT be scaled in SYNs.
-                repr.window_len = u16::try_from(self.rx_buffer.window()).unwrap_or(u16::MAX);
+                repr.window_len = u16::try_from(self.rx_window()).unwrap_or(u16::MAX);
                 if self.state == State::SynSent {
                     repr.ack_number = None;
                     repr.window_scale = Some(self.remote_win_shift);
