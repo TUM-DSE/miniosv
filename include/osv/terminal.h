@@ -1,10 +1,9 @@
 /*
  * Console geometry, for applications that render to the terminal.
  *
- * miniOSv has no ioctl: the terminal ioctls used to exist only so libc's
- * tcgetattr()/tcsetattr() could reach the console, and those now call it
- * directly. The one thing application code still asks a terminal for is its
- * size, so it asks for that and nothing else.
+ * ioctl() here returns ENOTTY, so TIOCGWINSZ is not a way to ask. The one
+ * thing application code still needs from a terminal is how big it is, so it
+ * asks for that directly and for nothing else.
  */
 
 #ifndef OSV_TERMINAL_H

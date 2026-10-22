@@ -36,10 +36,10 @@ and `mtools` + `gdisk` to build the disk image. Override the firmware with the `
 `OVMF_VARS` or `AAVMF_CODE`/`AAVMF_VARS` env vars. `make smoke-test` boots the image headless and
 checks it reaches the kernel.
 
-The default app (`app/app.cc`) is a conformance gate that prints a `PASS`/`FAIL` line per check.
-`app=` names the directory to link in instead: `make app=test` for the larger test suite,
-`app=app/miniduckdb` or `app=app/llama.cpp` for the submodules, or any directory holding a
-Makefile that sets `$(app-objects)`.
+The default app (`app/app.cc`) is a hello-world placeholder: it prints a greeting and then spins,
+so the boot output stays on the console. `app=` names the directory to link in instead:
+`make app=tests` for the larger test suite, `app=app/miniduckdb` or `app=app/llama.cpp` for the
+submodules, or any directory holding a Makefile that sets `$(app-objects)`.
 
 ## License
 
