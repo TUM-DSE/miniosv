@@ -306,12 +306,24 @@ inline std::vector<PMC> make_default_core_pmcs() {
 // counter twice.
 //
 // acquire() reserves on the calling cpu; release() and the wrap counting go
-// to the table the counter came from. With pinned threads each thread
-// reserves on its own cpu.
+// to the table the counter came from. The caller has to be pinned, see
+// acquire().
 struct PerCpuPMCSelect : PMCSelect {
   PerCpuPMCSelect() : PMCSelect({}), selections(sched::cpus.size()) {}
 
-  PMC *acquire(PMClass cls) override { return local().acquire(cls); }
+  // A counter belongs to the cpu it was reserved on. A thread that migrates
+  // while holding one starts it on one cpu and reads it on another, and gets
+  // a different core's count without any sign of it, so an unpinned caller
+  // gets no counter at all.
+  PMC *acquire(PMClass cls) override {
+    if (!sched::thread::current()->pinned()) {
+      std::cerr << "[ERROR] A hardware counter needs a pinned thread: call "
+                   "sched::thread::pin() first. Not measuring."
+                << std::endl;
+      return nullptr;
+    }
+    return local().acquire(cls);
+  }
 
   void release(PMC *pmc) override {
     if (PMCSelect *owner = owner_of(pmc))
@@ -391,10 +403,12 @@ struct Event {
   void start() {
     pmc = pmcs.acquire(pmce.pmClass);
     if (!pmc) {
-      std::cerr << "[ERROR] All hardware counters are occupied ("
-                << pmcs.size_of_x(pmce.pmClass) << "/"
-                << pmcs.size_of_x(pmce.pmClass) << "). Event " << pmce.name
-                << " will not be measured." << std::endl;
+      // An unpinned caller was already told by acquire().
+      if (sched::thread::current()->pinned())
+        std::cerr << "[ERROR] All hardware counters are occupied ("
+                  << pmcs.size_of_x(pmce.pmClass) << "/"
+                  << pmcs.size_of_x(pmce.pmClass) << "). Event " << pmce.name
+                  << " will not be measured." << std::endl;
       valid = false;
       return;
     }
