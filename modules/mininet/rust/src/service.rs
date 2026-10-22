@@ -35,6 +35,8 @@ pub struct GetResult {
     pub content_range: Option<ContentRange>,
     pub etag: Option<String>,
     pub last_modified: Option<String>,
+    /// From a worker taking the request to the head being in: the network's part, not the queue's.
+    pub ttfb_ns: Option<u64>,
 }
 
 /// Slot lifecycle. The submitter parks until this leaves `PENDING`, then waits
@@ -509,6 +511,7 @@ fn result_of(c: &mut crate::Conn) -> Result<GetResult, Error> {
         content_range: c.head().content_range,
         etag: c.head_mut().etag.take(),
         last_modified: c.head_mut().last_modified.take(),
+        ttfb_ns: None,
     })
 }
 
@@ -649,6 +652,11 @@ fn serve(
                         if pd.retried { " after re-dial" } else { "" },
                         e
                     );
+                }
+                let mut res = res;
+                if let Ok(g) = res.as_mut() {
+                    let head_ns = w.conn(slot).and_then(|c| c.head_ns());
+                    g.ttfb_ns = head_ns.map(|h| (h + epoch_ns).saturating_sub(pd.picked_ns));
                 }
                 pd.framed = true;
                 pd.failed = res.is_err();

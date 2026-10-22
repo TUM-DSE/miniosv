@@ -63,6 +63,8 @@ struct response {
     uint64_t range_total;
     char etag[ETAG_MAX];
     char last_modified[DATE_MAX];
+    //! From a worker taking the request to the response head, so without the queueing; 0 if unknown.
+    uint64_t ttfb_ns;
 };
 
 //! Call once; a second call is a no-op, and a concurrent one returns once the first has its verdict.

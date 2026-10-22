@@ -85,6 +85,7 @@ pub struct mininet_response {
     pub range_total: u64,
     pub etag: [c_char; ETAG_MAX],
     pub last_modified: [c_char; DATE_MAX],
+    pub ttfb_ns: u64,
 }
 
 pub(crate) fn set_cstr(dst: &mut [c_char], src: Option<&str>) {
@@ -279,6 +280,7 @@ pub extern "C" fn mininet_get(
                     }
                     set_cstr(&mut o.etag, r.etag.as_deref());
                     set_cstr(&mut o.last_modified, r.last_modified.as_deref());
+                    o.ttfb_ns = r.ttfb_ns.unwrap_or(0);
                 }
             }
             OK
@@ -293,6 +295,7 @@ pub extern "C" fn mininet_get(
                     o.has_range = 0;
                     set_cstr(&mut o.etag, None);
                     set_cstr(&mut o.last_modified, None);
+                    o.ttfb_ns = 0;
                 }
             }
             code(e)
