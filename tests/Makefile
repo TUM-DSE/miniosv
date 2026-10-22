@@ -12,6 +12,7 @@
 #   - os-libc      : C libc surface conformance checks (string/stdlib/math/...)
 #   - os-iostream  : C++ iostreams / localization checks (std::cout etc.)
 #   - os-memmove   : memmove() overlap-correctness regression test
+#   - os-string    : memcmp() correctness + throughput
 #   - os-memory    : the memory clients: early, heap, page cache, plus malloc/mmap
 #   - os-memory-primitives : vspace, frames and mapping, one header per function
 #   - os-stress    : concurrency / allocator / TLS stress tests
@@ -19,21 +20,22 @@
 #                    (needs --emulated-nvme at run time; skips without)
 #   - os-mininet   : network stack unit tests, no NIC needed; only when conf_net_mininet=1
 
-app-objects =  test/osv_tests.o
-app-objects += test/os-features.o
-app-objects += test/os-libc.o
-app-objects += test/os-iostream.o
-app-objects += test/os-memmove.o
-app-objects += test/os-memory.o
-app-objects += test/os-memory-primitives.o
-app-objects += test/os-stress.o
+app-objects =  tests/osv_tests.o
+app-objects += tests/os-features.o
+app-objects += tests/os-libc.o
+app-objects += tests/os-iostream.o
+app-objects += tests/os-memmove.o
+app-objects += tests/os-string.o
+app-objects += tests/os-memory.o
+app-objects += tests/os-memory-primitives.o
+app-objects += tests/os-stress.o
 
 ifeq ($(conf_net_mininet),1)
 mininet-features := selftest
 include modules/mininet/mininet.mk
-app-objects += test/os-mininet.o
+app-objects += tests/os-mininet.o
 app-objects += $(mininet-lib-objects)
 endif
 ifeq ($(conf_fs_miniext),1)
-app-objects += test/os-miniext.o
+app-objects += tests/os-miniext.o
 endif

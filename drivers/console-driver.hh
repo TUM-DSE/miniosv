@@ -16,8 +16,8 @@ namespace console {
 // initialization via dev_start().
 //
 // Input is optional and polls instead of relying on interrrupts.
-// 
-// read_char() returns the next byte, or -1 when none is waiting. 
+//
+// read_char() returns the next byte, or -1 when none is waiting.
 // Drivers that cannot read (early console) inherit the default and simply never produce input.
 class console_driver {
 public:
@@ -25,8 +25,8 @@ public:
     virtual void write(const char *str, size_t len) = 0;
     virtual void flush() = 0;
     virtual int read_char() { return -1; }
-    //! Whether a byte is waiting, without consuming it. select()/poll() need
-    //! to answer "is input ready" without taking the byte away from read().
+    // Whether a byte is waiting, without consuming it. select()/poll() need
+    // to answer "is input ready" without taking the byte away from read().
     virtual bool input_available() { return false; }
     void start();
 private:

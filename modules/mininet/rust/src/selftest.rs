@@ -1,4 +1,4 @@
-//! Unit tests for the pure-logic parts, driven by test/os-mininet.cc (make app=test):
+//! Unit tests for the pure-logic parts, driven by tests/os-mininet.cc (make app=tests):
 //! no_std, no `cargo test` target, and the guest's real allocator is where a bounds bug shows.
 
 use alloc::vec;

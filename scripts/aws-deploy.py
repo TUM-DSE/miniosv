@@ -281,10 +281,10 @@ def launch(ec2_client, run_kwargs: dict, market: str, zone=None) -> tuple[dict, 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("src", nargs="?", default="build/last/loader.img",
-                        help="Path to the source image file to upload (default: build/last/loader.img)")
     parser.add_argument("region", help="AWS region to deploy to (e.g. us-east-1)")
     parser.add_argument("instance", help="EC2 instance type to launch (e.g. t3.micro)")
+    parser.add_argument("--image", default="build/last/loader.img",
+                        help="Path to the source image file to upload (default: build/last/loader.img)")
     parser.add_argument("--attach", action="store_true", help="Stream system log and terminate instance on Ctrl+C")
     parser.add_argument("--subnet", help="VPC subnet ID to launch into (needed for buckets locked to a VPC endpoint)")
     parser.add_argument("--zone", help="Launch only in this availability zone (a bench client beside the server it dials)")
@@ -294,7 +294,7 @@ def main():
                         help="Security group ID to attach; may be repeated. Required when --subnet is set unless the subnet's default SG is acceptable.")
     parser.add_argument("--aws-profile", default=None, metavar="NAME",
                         help="AWS credentials profile (default: $AWS_PROFILE)")
-    parser.add_argument("--market", choices=("on-demand", "spot", "spot-or-on-demand"), default="on-demand",
+    parser.add_argument("--market", choices=("on-demand", "spot", "spot-or-on-demand"), default="spot-or-on-demand",
                         help="Launch market; 'spot' fails if spot cannot be provided, 'spot-or-on-demand' falls back")
     args = parser.parse_args()
     if args.aws_profile:
@@ -302,7 +302,7 @@ def main():
 
     aws_login()
 
-    src, region, instance = args.src, args.region, args.instance
+    src, region, instance = args.image, args.region, args.instance
     instance_arch = get_instance_arch(instance)
 
     if src.endswith(".raw"):
@@ -423,7 +423,8 @@ def main():
     print("Waiting for AMI to become 'available'...")
     ec2_client.get_waiter('image_available').wait(ImageIds=[ami_id])
 
-    print(f"Launching {instance} instance from {ami_id}...")
+    print(f"Launching {instance} instance from {ami_id}"
+          f"{f' in {args.subnet}' if args.subnet else ''}...")
     run_kwargs = dict(
         ImageId=ami_id,
         InstanceType=instance,

@@ -27,7 +27,7 @@
 #define CONF_net_mininet 1
 #endif
 #ifndef CONF_interrupt_stack_size
-#define CONF_interrupt_stack_size 0x1000
+#define CONF_interrupt_stack_size 0x2000
 #endif
 #ifndef CONF_lazy_stack
 #define CONF_lazy_stack 0

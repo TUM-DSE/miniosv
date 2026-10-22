@@ -325,7 +325,7 @@ pub extern "C" fn mininet_clear_stats() {
 ///
 /// Needs no NIC and no network: it is the parser, the body sink and the
 /// completion rule, exercised against buffers this function allocates itself.
-/// Driven by `test/os-mininet.cc` under `make app=test`.
+/// Driven by `tests/os-mininet.cc` under `make app=tests`.
 #[cfg(feature = "selftest")]
 #[unsafe(no_mangle)]
 pub extern "C" fn mininet_selftest(verbose: c_int) -> u32 {

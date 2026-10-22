@@ -43,3 +43,7 @@ downloaded_packages
 .firecracker
 external/llvm-project/
 aws
+
+# `nix build` output symlinks
+/result
+/result-*
