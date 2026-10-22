@@ -178,9 +178,12 @@ inline bool pmu_has_long_event_counters() {
 // worst reset twice while neither has armed a counter yet. Called with
 // migration off.
 inline void pmu_reset_once() {
-  static std::atomic<uint64_t> done{0};
-  static_assert(sched::max_cpus <= 64, "one bit per cpu");
-  uint64_t bit = 1ull << sched::cpu::current()->id;
+  // One bit per cpu, rounded up to whole words. The words are atomic because
+  // cpus sharing a word set their bits concurrently.
+  static std::atomic<uint64_t> done_words[(sched::max_cpus + 63) / 64];
+  unsigned cpu = sched::cpu::current()->id;
+  std::atomic<uint64_t> &done = done_words[cpu / 64];
+  uint64_t bit = 1ull << (cpu % 64);
   if (done.load(std::memory_order_acquire) & bit)
     return;
   asm volatile("msr pmcntenclr_el0, %0\n\t"
