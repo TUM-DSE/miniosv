@@ -12,6 +12,8 @@ panic = "abort"
 
 [profile.release]
 panic = "abort"
+lto = "fat"
+codegen-units = 1
 
 [dependencies.smoltcp]
 version = "0.13.1"
