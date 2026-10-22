@@ -48,3 +48,7 @@ optional = true
 
 [dependencies.webpki-roots]
 version = "0.26"
+
+# smoltcp with a zero-copy receive hook (vendor/smoltcp, against 0.13.1): in-order payload stays in the NIC's buffers.
+[patch.crates-io]
+smoltcp = { path = "vendor/smoltcp" }
