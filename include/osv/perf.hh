@@ -79,14 +79,14 @@ struct PMC {
     return *this;
   }
 
-  uint64_t read() const { return pmc_read(perfCtr); }
+  uint64_t read() const { return pmc_read(perfCtr, pmClass); }
 
   bool start_with_conf(uint64_t value, uint64_t initial = 0) {
-    pmc_write_counter(perfCtr, initial);
-    return pmc_start_with_conf(perfCtr, perfEvtSel, value);
+    pmc_write_counter(perfCtr, pmClass, initial);
+    return pmc_start_with_conf(perfCtr, perfEvtSel, pmClass, value);
   }
 
-  void stop() { pmc_stop(perfEvtSel); }
+  void stop() { pmc_stop(perfEvtSel, pmClass); }
 };
 
 // A set of counters to reserve from. The hardware counters are per cpu, so a
@@ -160,7 +160,7 @@ struct PMCSelect {
     std::lock_guard<std::mutex> guard(wrap_lock);
     if (counting_wraps.load(std::memory_order_relaxed))
       return;
-    if (pmc_overflow_width(0) > 32)
+    if (pmc_overflow_width(0, PMClass::CORE) > 32)
       return;
     unsigned cpu = sched::cpu::current()->id;
     wrap_irq = pmc_attach_overflow_handler(
@@ -181,7 +181,7 @@ struct PMCSelect {
       if (!mine)
         return;
       for (auto &pmc : pmcs) {
-        if (mine & pmc_overflow_bit(pmc.perfCtr))
+        if (mine & pmc_overflow_bit(pmc.perfCtr, pmc.pmClass))
           pmc.wraps.fetch_add(1, std::memory_order_relaxed);
       }
       pmc_ack_overflow_mask(mine, wrap_irq);
@@ -201,17 +201,17 @@ struct PMCSelect {
   virtual void arm_wrap_counting(PMC *pmc) {
     if (!counts_wraps())
       return;
-    uint64_t bit = pmc_overflow_bit(pmc->perfCtr);
+    uint64_t bit = pmc_overflow_bit(pmc->perfCtr, pmc->pmClass);
     pmc_ack_overflow_mask(bit, wrap_irq);
     armed_mask.fetch_or(bit, std::memory_order_relaxed);
-    pmc_overflow_ack_conf(pmc->perfCtr);
+    pmc_overflow_ack_conf(pmc->perfCtr, pmc->pmClass);
   }
 
   // Stop taking interrupts for a counter nobody is measuring any more.
   virtual void disarm_wrap_counting(PMC *pmc) {
     if (!counts_wraps())
       return;
-    uint64_t bit = pmc_overflow_bit(pmc->perfCtr);
+    uint64_t bit = pmc_overflow_bit(pmc->perfCtr, pmc->pmClass);
     armed_mask.fetch_and(~bit, std::memory_order_relaxed);
     pmc_disable_overflow_int(bit);
   }
@@ -292,7 +292,9 @@ inline std::vector<PMC> make_default_core_pmcs() {
   // Armv8 PMUv3 usually has 6 counters (ids 0-5).
   for (uint32_t i = 0; i < 6; ++i)
     pmcs.emplace_back(i, i, PMClass::CORE);
-  pmcs.emplace_back(1u << 31, 1u << 31, PMClass::CYCLES);
+  // The cycle counter has registers of its own, selected by the class, so its
+  // id is never read -- hence 0 rather than a sentinel that means "not an id".
+  pmcs.emplace_back(0, 0, PMClass::CYCLES);
 #endif
   return pmcs;
 }
@@ -412,7 +414,7 @@ struct Event {
       valid = false;
       return;
     }
-    width = pmc_overflow_width(pmc->perfCtr);
+    width = pmc_overflow_width(pmc->perfCtr, pmc->pmClass);
     polled = 0;
     // Asked here, on the cpu the counter was reserved on.
     counted_wraps = pmcs.counts_wraps();
@@ -673,7 +675,7 @@ struct PerfSampler {
   bool start() {
     if (pmc || !(pmc = pmcs.acquire(pmce.pmClass)))
       return false;
-    ack = pmc_overflow_ack_conf(pmc->perfCtr);
+    ack = pmc_overflow_ack_conf(pmc->perfCtr, pmc->pmClass);
     // Drop a flag left by the counter's previous owner before the handler goes
     // in: the PMU interrupt is level-triggered, so a stale flag would fire the
     // handler the moment it is attached.
@@ -684,12 +686,14 @@ struct PerfSampler {
       // other clusters' tables, so it fires for overflows that are not ours.
       if (!pmc_overflow_pending(ack))
         return;
-      pmc_write_counter(pmc->perfCtr, pmc_period_value(pmc->perfCtr, period));
+      pmc_write_counter(pmc->perfCtr, pmc->pmClass,
+                        pmc_period_value(pmc->perfCtr, pmc->pmClass, period));
       pmc_ack_overflow(ack, vector);
       handler(current_interrupt_frame);
     });
     if (!pmc->start_with_conf(pmce.bitmap | pmc_int_enable,
-                              pmc_period_value(pmc->perfCtr, period))) {
+                              pmc_period_value(pmc->perfCtr, pmc->pmClass,
+                                               period))) {
       pmc_detach_overflow_handler(vector, ack.mask);
       pmcs.release(pmc);
       pmc = nullptr;
