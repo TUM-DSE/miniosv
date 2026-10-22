@@ -14,18 +14,27 @@
 namespace perf {
 
 inline constexpr uint32_t midr_fixed_mask = 0xFF0F'FFF0u;
+inline constexpr uint32_t midr_cortex_a76 = 0x410F'D0B0u;
+inline constexpr uint32_t midr_cortex_a55 = 0x410F'D050u;
 
 // Number of hardware event counters (PMCR_EL0.N, bits 15:11).
+inline uint32_t pmu_version() {
+  uint64_t dfr0;
+  // ID_AA64DFR0_EL1.PMUVer, bits 11:8: 0 no PMU, 1 PMUv3, 4 v3p1, 5 v3p4,
+  // 6 v3p5, ..., 0xF IMPLEMENTATION DEFINED
+  // (Arm ARM DDI 0487, ID_AA64DFR0_EL1).
+  asm volatile("mrs %0, id_aa64dfr0_el1" : "=r"(dfr0));
+  return (dfr0 >> 8) & 0xF;
+}
+
 inline uint32_t pmu_num_counters() {
+  // PMCR_EL0 and the rest of the PMU registers are undefined without PMUv3.
+  if (pmu_version() == 0)
+    return 0;
   uint64_t pmcr;
   asm volatile("mrs %0, pmcr_el0" : "=r"(pmcr));
   return (pmcr >> 11) & 0x1F;
 }
-
-// Implementer=0x41 (Arm), Arch=0xF, Part=0xD0B/0xD05. The RK3588 pairs four
-// A55s with four A76s; both implement the same PMUv3 event subset.
-inline constexpr uint32_t midr_cortex_a76 = 0x410F'D0B0u;
-inline constexpr uint32_t midr_cortex_a55 = 0x410F'D050u;
 
 inline uint32_t midr_read() {
   uint64_t midr;
@@ -33,19 +42,55 @@ inline uint32_t midr_read() {
   return static_cast<uint32_t>(midr) & midr_fixed_mask;
 }
 
-// Match against MIDR_EL1 (implementer/arch/part bits).
 inline bool is_midr(uint32_t to_check) { return midr_read() == to_check; }
+
+// Identifies the cpu design. An asymmetric SoC (Cortex-A76 + A55) gives its
+// clusters different counter counts and different event support, so anything
+// cached per-PMU has to be keyed on this rather than probed once on the boot
+// cpu.
+inline uint32_t pmu_design_id() { return midr_read(); }
+
+inline const char *midr_core_name(uint32_t midr) {
+  switch (midr) {
+  case midr_neoverse_v1:
+    return "neoverse-v1";
+  case midr_cortex_a76:
+    return "cortex-a76";
+  case midr_cortex_a55:
+    return "cortex-a55";
+  default:
+    return "unknown";
+  }
+}
 
 // SMCCC vendor hypervisor UID (function 0x8600FF01); KVM's UUID comes from
 // Linux arch/arm64/kvm/hypercalls.c.
 inline bool is_kvm_guest() {
-  register uint64_t x0 asm("x0") = 0x8600FF01ull;
-  register uint64_t x1 asm("x1");
-  register uint64_t x2 asm("x2");
-  register uint64_t x3 asm("x3");
-  asm volatile("hvc #0" : "+r"(x0), "=r"(x1), "=r"(x2), "=r"(x3));
-  return x0 == 0xb66fb428ull && x1 == 0xe911c52eull &&
-         x2 == 0x564bcaa9ull && x3 == 0x743a004dull;
+  static const bool kvm = [] {
+    // HVC only where firmware answers it: the PSCI conduit from the ACPI FADT
+    // ARM boot flags, as in arch/aarch64/psci.cc (Arm ARM DDI 0487, HVC). KVM
+    // always uses HVC.
+    uint16_t flags = acpi::arm_boot_flags();
+    if (!(flags & acpi::FADT_ARM_PSCI_COMPLIANT) ||
+        !(flags & acpi::FADT_ARM_PSCI_USE_HVC))
+      return false;
+    register uint64_t x0 asm("x0") = 0x8600FF01ull;
+    register uint64_t x1 asm("x1");
+    register uint64_t x2 asm("x2");
+    register uint64_t x3 asm("x3");
+    // Fast SMC32/HVC32 call: the UID comes back in W0..W3; under SMCCC v1.0
+    // the callee may corrupt X4..X17 (Arm DEN 0028).
+    asm volatile("hvc #0"
+                 : "+r"(x0), "=r"(x1), "=r"(x2), "=r"(x3)
+                 :
+                 : "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12",
+                   "x13", "x14", "x15", "x16", "x17", "memory");
+    return static_cast<uint32_t>(x0) == 0xb66fb428u &&
+           static_cast<uint32_t>(x1) == 0xe911c52eu &&
+           static_cast<uint32_t>(x2) == 0x564bcaa9u &&
+           static_cast<uint32_t>(x3) == 0x743a004du;
+  }();
+  return kvm;
 }
 
 inline uint64_t pmceid0_read() {
@@ -63,6 +108,8 @@ inline uint64_t pmceid1_read() {
 enum class event_support { yes, no, unknown };
 
 inline event_support pmu_event_support(uint64_t value) {
+  if (pmu_version() == 0)
+    return event_support::no;
   uint64_t pmceid;
   uint64_t bit;
   if (value < 0x20) {
@@ -115,20 +162,55 @@ inline uint64_t pmcr_read() {
   return pmcr;
 }
 
-inline void enable_pmu() {
+// Support for 64-bit event counters (FEAT_PMUv3p5, PMCR_EL0.LP).
+inline bool pmu_has_long_event_counters() {
+  uint32_t version = pmu_version();
+  return version >= 6 && version != 0xF;
+}
+
+// Clears every counter enable, interrupt enable and overflow flag and resets
+// the counters: they are unknown at reset, and a stale flag whose interrupt
+// is still enabled keeps the level-triggered PMU interrupt asserted forever.
+// This stops whatever the cpu is counting, so it runs once per cpu, before
+// anything is armed there, not once per PerfEvent or PMCSampler: a sampler
+// built next to a running PerfEvent used to zero it, and vice versa. The bit
+// is set after the reset, so a preempting thread on the same cpu can at
+// worst reset twice while neither has armed a counter yet. Called with
+// migration off.
+inline void pmu_reset_once() {
+  // One bit per cpu, rounded up to whole words. The words are atomic because
+  // cpus sharing a word set their bits concurrently.
+  static std::atomic<uint64_t> done_words[(sched::max_cpus + 63) / 64];
+  unsigned cpu = sched::cpu::current()->id;
+  std::atomic<uint64_t> &done = done_words[cpu / 64];
+  uint64_t bit = 1ull << (cpu % 64);
+  if (done.load(std::memory_order_acquire) & bit)
+    return;
   asm volatile("msr pmcntenclr_el0, %0\n\t"
                "msr pmintenclr_el1, %0\n\t"
                "msr pmovsclr_el0, %0\n\t"
                "isb" ::"r"((uint64_t)0xFFFFFFFF)
                : "memory");
+  asm volatile("msr pmcr_el0, %0\n\tisb" ::"r"(pmcr_read() | pmcr_p | pmcr_c)
+               : "memory");
+  done.fetch_or(bit, std::memory_order_acq_rel);
+}
 
-  // LC|LP widen the counters to 64 bits; LP is RES0 before FEAT_PMUv3p5.
-  uint64_t pmcr = (pmcr_read() | pmcr_e | pmcr_p | pmcr_c | pmcr_lc | pmcr_lp) &
-                  ~pmcr_d;
+// Idempotent: only ever adds enable bits, so it is safe beside a running
+// counter on the same cpu.
+inline void enable_pmu() {
+  if (pmu_version() == 0)
+    return;
+  std::lock_guard<migration_lock_t> stay(migration_lock);
+  pmu_reset_once();
+
+  // LC|LP widen the counters to 64 bits; LP needs FEAT_PMUv3p5.
+  uint64_t lp = pmu_has_long_event_counters() ? pmcr_lp : 0;
+  uint64_t pmcr = (pmcr_read() | pmcr_e | pmcr_lc | lp) & ~pmcr_d;
   asm volatile("msr pmcr_el0, %0\n\tisb" ::"r"(pmcr) : "memory");
 
   static bool warned = false;
-  if (!warned && !(pmcr_read() & pmcr_lp)) {
+  if (!warned && !lp) {
     warned = true;
     std::cout << "This PMU has no FEAT_PMUv3p5: the event counters are 32 bits "
                  "wide and wrap after 2^32 events."
@@ -158,6 +240,12 @@ inline void pmc_write_counter(uint32_t counter, uint64_t value) {
 
 inline bool pmc_start_with_conf(uint32_t counter, uint32_t evt_sel,
                                 uint64_t value) {
+  // Only event counters 0..5 and the cycle counter are wired up below. PMUv3
+  // has up to 31 event counters (PMCR_EL0.N); counters 6..30 would need the
+  // PMSELR_EL0 + PMXEVTYPER_EL0 / PMXEVCNTR_EL0 indirection (Arm ARM DDI 0487).
+  // Until then they are refused instead of counting a stale event type.
+  if (evt_sel > 5 && evt_sel != (1u << 31))
+    return false;
   // PMEVTYPER<n>_EL0.evtCount is bits [15:0]; the rest are exception filters.
   if (!is_event_supported(value & 0xFFFF))
     return false;
@@ -173,8 +261,13 @@ inline bool pmc_start_with_conf(uint32_t counter, uint32_t evt_sel,
   case 5: asm volatile("msr pmevtyper5_el0, %0" : : "r"(value)); break;
     // clang-format on
   case (1u << 31):
-    asm volatile("msr pmcntenset_el0, %0\n\t"
-                 "isb" ::"r"((uint64_t)(1u << 31))
+    // The cycle counter needs special handling
+    // (Arm ARM DDI 0487, PMCCFILTR_EL0).
+    asm volatile("msr pmccfiltr_el0, %0\n\t"
+                 "isb\n\t"
+                 "msr pmcntenset_el0, %1\n\t"
+                 "isb" ::"r"(value & ~0xFFFFull),
+                 "r"((uint64_t)(1u << 31))
                  : "memory");
     return true;
   }
@@ -184,8 +277,10 @@ inline bool pmc_start_with_conf(uint32_t counter, uint32_t evt_sel,
   return true;
 }
 
+// Counters without a case below (event counters >= 6, see
+// pmc_start_with_conf()) read as 0.
 inline uint64_t pmc_read(uint32_t counter) {
-  uint64_t value;
+  uint64_t value = 0;
   switch (counter) {
     // clang-format off
   case 0: asm volatile("mrs %0, pmevcntr0_el0" : "=r"(value)); break;
@@ -227,15 +322,10 @@ inline void pmc_ack_overflow_mask(uint64_t mask, PMCIntHandle) {
   asm volatile("msr pmovsclr_el0, %0\n\tisb" ::"r"(mask) : "memory");
 }
 
-inline uint32_t pmu_probe_event_counter_width() {
-  static const uint32_t width = [] {
-    uint64_t saved = pmc_read(0);
-    pmc_write_counter(0, 1ull << 32);
-    uint64_t back = pmc_read(0);
-    pmc_write_counter(0, saved);
-    return back ? 64u : 32u;
-  }();
-  return width;
+// Width of the event counters: 64 bits with support for FEAT_PMUv3p5 and
+// PMCR_EL0.LP set, 32 otherwise.
+inline uint32_t pmu_event_counter_width() {
+  return pmu_has_long_event_counters() && (pmcr_read() & pmcr_lp) ? 64 : 32;
 }
 
 // Where overflow is recorded, not the register size: PMCCNTR_EL0 counts 64-bit
@@ -243,7 +333,7 @@ inline uint32_t pmu_probe_event_counter_width() {
 inline uint32_t pmc_overflow_width(uint32_t counter) {
   if (counter == (1u << 31))
     return (pmcr_read() & pmcr_lc) ? 64 : 32;
-  return (pmcr_read() & pmcr_lp) ? pmu_probe_event_counter_width() : 32;
+  return pmu_event_counter_width();
 }
 
 // PMOVSCLR_EL0 reads as the overflow status; writing clears the bits set.
@@ -251,6 +341,25 @@ inline uint64_t pmu_overflow_status() {
   uint64_t v;
   asm volatile("mrs %0, pmovsclr_el0" : "=r"(v));
   return v;
+}
+
+// Drop a pending overflow without touching the interrupt enables. Used before
+// a handler is attached, so a flag left by the counter's previous owner cannot
+// fire it immediately.
+inline void pmc_clear_overflow(PMCOverflowAck ack) {
+  asm volatile("msr pmovsclr_el0, %0\n\tisb" ::"r"(ack.mask) : "memory");
+}
+
+// The PMU interrupt is one PPI shared by every handler on the cpu, so a
+// handler has to ask whether the overflow was its own.
+inline bool pmc_overflow_pending(PMCOverflowAck ack) {
+  return (pmu_overflow_status() & ack.mask) != 0;
+}
+
+// Stop taking overflow interrupts for the counters named by `mask`, leaving
+// every other counter's interrupt enable alone.
+inline void pmc_disable_overflow_int(uint64_t mask) {
+  asm volatile("msr pmintenclr_el1, %0\n\tisb" ::"r"(mask) : "memory");
 }
 
 inline uint64_t pmc_period_value(uint32_t counter, uint64_t period) {
@@ -285,8 +394,20 @@ inline PMCIntHandle pmc_attach_overflow_handler(std::function<void()> handler) {
                            std::move(handler));
 }
 
-inline void pmc_detach_overflow_handler(PMCIntHandle irq) {
-  asm volatile("msr pmintenclr_el1, %0\n\tisb" ::"r"(~0ull) : "memory");
+// The PMU interrupt is one PPI shared by every handler on the cpu, and the
+// dispatcher runs the first handler whose ack claims the interrupt. "mine"
+// is that claim, so each handler only runs for its own overflows.
+inline PMCIntHandle pmc_attach_overflow_handler(std::function<bool()> mine,
+                                                std::function<void()> handler) {
+  return new ppi_interrupt(gic::irq_type::IRQ_TYPE_LEVEL, pmu_irq_id(),
+                           std::move(mine), std::move(handler));
+}
+
+// Disables only the counters named by `mask`. Clearing PMINTENSET wholesale
+// would silently switch off the wrap-counting handler, which shares this
+// interrupt and has no way to notice.
+inline void pmc_detach_overflow_handler(PMCIntHandle irq, uint64_t mask) {
+  pmc_disable_overflow_int(mask);
   delete irq;
 }
 
@@ -404,42 +525,59 @@ constexpr PMCEvent REMOTE_ACCESS = {0x31, CORE, "remote-accesses"};
 constexpr PMCEvent DTLB_WALK = {0x34, CORE, "dtlb-walks"};
 // Instruction TLB access with at least one translation table walk
 constexpr PMCEvent ITLB_WALK = {0x35, CORE, "itlb-walks"};
-// Last level data cache read
+// Last level data cache read (LL_CACHE_RD): reads only, not writes
 constexpr PMCEvent LL_CACHE = {0x36, CORE, "ll-cache-accesses"};
-// Last level data cache read miss
+// Last level data cache read miss (LL_CACHE_MISS_RD): read misses only
 constexpr PMCEvent LL_CACHE_MISS = {0x37, CORE, "ll-cache-misses"};
-// Level 1 data cache read miss
+// Level 1 data cache long-latency read miss (L1D_CACHE_LMISS_RD): only read
+// misses, and only those that incur additional latency. All L1D refills are
+// L1D_CACHE_REFILL.
 constexpr PMCEvent L1D_CACHE_MISS = {0x39, CORE, "l1d-cache-misses"};
 // Operation retired
 constexpr PMCEvent OP_COMPLETE = {0x3A, CORE, "micro-operations-retired"};
 // Operation speculated
 constexpr PMCEvent OP_SPEC = {0x3B, CORE, "micro-operations-speculated"};
 // No operation sent for execution
-constexpr PMCEvent STALL = {0x3C, CORE, ""};
+constexpr PMCEvent STALL = {0x3C, CORE, "stalls"};
 // No operation sent for execution on a slot because of the backend
-constexpr PMCEvent STALL_OP_BACKEND = {0x3D, CORE, ""};
+constexpr PMCEvent STALL_OP_BACKEND = {0x3D, CORE, "backend-slot-stalls"};
 // No operation sent for execution on a slot because of the frontend
-constexpr PMCEvent STALL_OP_FRONTEND = {0x3E, CORE, ""};
+constexpr PMCEvent STALL_OP_FRONTEND = {0x3E, CORE, "frontend-slot-stalls"};
 // No operation sent for execution on a slot
-constexpr PMCEvent STALL_OP = {0x3F, CORE, ""};
+constexpr PMCEvent STALL_OP = {0x3F, CORE, "slot-stalls"};
 
-// Level 2 data cache long-latency read miss (Armv8.4/Armv9 0x40xx range).
+// Level 2 data cache long-latency read miss (Armv8.4/Armv9 0x40xx range):
+// refills from reads that incurred additional latency, not every L2 miss.
 constexpr PMCEvent L2D_CACHE_LMISS_RD = {0x4009, CORE, "l2d-cache-misses"};
 
-inline const PMCEvent L2D_CACHE_MISS =
-    pmu_event_support(L2D_CACHE_LMISS_RD.bitmap) == event_support::yes
-        ? L2D_CACHE_LMISS_RD
-        : L2D_CACHE_REFILL;
+// Resolved on the cpu that reads it, not latched at static-init time: on an
+// asymmetric SoC the two clusters implement different events, and a choice made
+// once on the boot cpu would be wrong on the other cluster. Converts to
+// PMCEvent, so it is still spelled like the plain event constants around it.
+struct L2DCacheMissEvent {
+  operator PMCEvent() const {
+    return pmu_event_support(L2D_CACHE_LMISS_RD.bitmap) == event_support::yes
+               ? L2D_CACHE_LMISS_RD
+               : L2D_CACHE_REFILL;
+  }
+};
+inline constexpr L2DCacheMissEvent L2D_CACHE_MISS{};
 } // namespace PERF_COUNT_HW
 
 inline void pmu_dump_state() {
+  if (pmu_version() == 0) {
+    std::cout << "PMU: none (ID_AA64DFR0_EL1.PMUVer is 0)" << std::endl;
+    return;
+  }
   uint64_t pmcnten;
   asm volatile("mrs %0, pmcntenset_el0" : "=r"(pmcnten));
-  std::cout << "PMU: midr=0x" << std::hex << midr_read() << " pmcr=0x"
+  std::cout << "PMU: core=" << midr_core_name(midr_read()) << " midr=0x"
+            << std::hex << midr_read() << " pmcr=0x"
             << pmcr_read() << " pmceid0=0x" << pmceid0_read() << " pmceid1=0x"
             << pmceid1_read() << " pmcntenset=0x" << pmcnten << std::dec
             << " counters=" << pmu_num_counters()
-            << " event-counter-width=" << pmu_probe_event_counter_width()
+            << " pmuver=0x" << std::hex << pmu_version() << std::dec
+            << " event-counter-width=" << pmu_event_counter_width()
             << std::endl;
 
   std::cout << "PMU implemented events:";

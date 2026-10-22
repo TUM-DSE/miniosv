@@ -27,6 +27,7 @@ int os_libc_main();
 int os_stress_main();
 int os_iostream_main();
 int os_memmove_main();
+int os_string_main();
 int os_memory_main();
 int os_memory_primitives_main();
 #if CONF_fs_miniext
@@ -48,6 +49,7 @@ const suite suites[] = {
 	{"libc",     os_libc_main,     "C libc surface conformance"},
 	{"iostream", os_iostream_main, "C++ iostreams and localization"},
 	{"memmove",  os_memmove_main,  "memmove() overlap correctness"},
+	{"string",   os_string_main,   "memcmp() correctness and throughput"},
 	{"memory",   os_memory_main,   "the memory clients: early, heap, page cache"},
 	{"memory-primitives", os_memory_primitives_main, "the memory primitives: vspace, frames, mapping"},
 #if CONF_fs_miniext

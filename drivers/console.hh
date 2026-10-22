@@ -8,6 +8,8 @@
 #ifndef DRIVERS_CONSOLE_HH
 #define DRIVERS_CONSOLE_HH
 
+#include <termios.h>
+
 #include "console-driver.hh"
 
 struct termios;
@@ -15,9 +17,7 @@ struct winsize;
 
 namespace console {
 
-// The console's terminal settings, such as they are. Exposed so libc's
-// ioctl(TCGETS/TCSETS/TIOCGWINSZ) can answer for the standard streams: an
-// interactive program asks before it will do line editing.
+// The terminal settings of the console, for the termios calls.
 extern ::termios tio;
 extern ::winsize ws;
 
