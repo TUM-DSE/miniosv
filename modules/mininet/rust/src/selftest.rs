@@ -561,7 +561,7 @@ mod loopback {
         pub(super) fn connect(&mut self, head: &[u8], sink: Box<dyn BodySink>) -> Conn {
             let dst = (Ipv4Address::new(127, 0, 0, 1), 80);
             let _ = self.sockets.get_mut::<tcp::Socket>(self.client).connect(self.iface.context(), dst, 49152);
-            Conn::new(self.client, 0, 0, 49152, None, head, sink, ConnBufs::new(), self.now_ns())
+            Conn::new(self.client, 0, 0, 49152, None, head, sink, ConnBufs::new(), self.now_ns(), core::ptr::null(), core::ptr::null())
         }
 
         pub(super) fn now_ns(&self) -> u64 {
@@ -643,7 +643,7 @@ fn test_loopback_http(r: &mut Report) {
         r.check(env.reusable(&conn), "the connection is left open for reuse");
 
         let mut g2 = Guarded::new(5);
-        conn.reset_for(GET, Box::new(g2.sink()), env.now_ns());
+        conn.reset_for(GET, Box::new(g2.sink()), env.now_ns(), core::ptr::null());
         let step = env.drive(&mut conn, b"HTTP/1.1 206 Partial Content\r\nContent-Length: 5\r\n\r\nworld", Server::Reply);
         r.check(step == Step::Complete, "a second request on the kept connection completes");
         r.check(g2.body() == b"world" && g.body() == b"hello", "each request fills its own sink");

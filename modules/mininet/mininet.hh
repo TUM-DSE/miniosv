@@ -42,6 +42,9 @@ struct config {
     //! 0: each worker polls its queue forever on a cpu of its own. Otherwise a worker that has had nothing to do
     //! for this long arms its queue's interrupt and sleeps, and its cpu runs other threads until traffic returns.
     uint32_t idle_us;
+    //! 0: the calling thread copies its body out of the NIC's frames, or decrypts it there, itself. Otherwise the
+    //! workers write it into the caller's buffer.
+    uint32_t worker_copies;
 };
 
 enum : size_t {

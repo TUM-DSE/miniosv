@@ -42,6 +42,8 @@ uint8_t *shim_mbuf_alloc_tx(void *pool, uint16_t queue_id, void **out_handle,
 uint16_t shim_mbuf_tx_burst(uint16_t port_id, uint16_t queue_id, void **handles,
                             const uint16_t *lens, uint16_t n);
 void shim_mbuf_free(void *handle);
+// One more holder of a received frame; each holder frees it once. Worker thread only: the count is not atomic.
+void shim_mbuf_ref(void *handle);
 
 // [ipackets, opackets, ibytes, obytes, imissed, ierrors, oerrors, rx_nombuf]
 int shim_eth_stats(uint16_t port_id, uint64_t *out, uint16_t n);

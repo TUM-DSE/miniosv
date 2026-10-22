@@ -24,10 +24,13 @@ mod dhcp;
 mod dns;
 mod endpoint;
 mod error;
+mod feed;
 mod ffi;
 mod http;
 mod nic;
+mod record;
 mod rss;
+mod rx;
 #[cfg(feature = "selftest")]
 mod selftest;
 mod service;
@@ -62,6 +65,8 @@ pub struct Config<'a> {
     pub rx_desc: u16,
     /// An interrupt per Rx queue, for workers that sleep when idle.
     pub rx_intr: bool,
+    /// Frames each queue's connections may hold at once on top of the rings: their readers' share.
+    pub rx_hold: u32,
     /// The one host dialled, if known: on the local subnet it is resolved on
     /// queue 0 in the gateway's place, since ARP replies steer nowhere else.
     pub peer: Option<[u8; 4]>,
@@ -132,7 +137,7 @@ impl Stack {
             if n == 0 {
                 continue;
             }
-            let (pools, mac) = nic::probe_and_open(id, n, cfg.rx_desc, cfg.rx_intr)?;
+            let (pools, mac) = nic::probe_and_open(id, n, cfg.rx_desc, cfg.rx_intr, cfg.rx_hold)?;
             let rss = rss::Rss::load(id, n)?;
             let netif = dhcp::learn_network(id, &pools, mac, cfg.peer, cfg.resolve)?;
             ports.push(Port { id, pools, rss, netif, queues: n });

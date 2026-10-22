@@ -54,14 +54,16 @@ pub(crate) fn probe_and_open(
     n_queues: u16,
     rx_desc: u16,
     rx_intr: bool,
+    rx_hold: u32,
 ) -> Result<(Vec<PktPool>, [u8; 6]), Error> {
     const DATA_ROOM_SIZE: u16 = 9216;
     // 1024 descriptors dropped 3.3% of inbound frames (imissed) between polls.
     const DESC_NUM: u16 = 4096;
     const CACHE: u32 = 64;
     let rx_want = if rx_desc == 0 { DESC_NUM } else { rx_desc };
-    // Every simultaneous holder: RX ring, TX ring awaiting reclaim, cache, RX burst.
-    let per_queue_size: u32 = (rx_want as u32) + (DESC_NUM as u32) + CACHE + RX_BURST as u32 + 512;
+    // Every simultaneous holder: RX ring, TX ring awaiting reclaim, cache, RX burst, and the frames whose
+    // payload waits for its reader.
+    let per_queue_size: u32 = (rx_want as u32) + (DESC_NUM as u32) + CACHE + RX_BURST as u32 + 512 + rx_hold;
 
     let mut pools: Vec<PktPool> = Vec::with_capacity(n_queues as usize);
     for q in 0..n_queues {

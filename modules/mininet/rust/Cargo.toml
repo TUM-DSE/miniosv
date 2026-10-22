@@ -49,6 +49,11 @@ optional = true
 [dependencies.webpki-roots]
 version = "0.26"
 
+# The AEAD behind rustls's ring provider, for the records after the handshake.
+[dependencies.ring]
+version = "0.17"
+default-features = false
+
 # smoltcp with a zero-copy receive hook (vendor/smoltcp, against 0.13.1): in-order payload stays in the NIC's buffers.
 [patch.crates-io]
 smoltcp = { path = "vendor/smoltcp" }

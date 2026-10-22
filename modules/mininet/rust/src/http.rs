@@ -137,6 +137,38 @@ impl ResponseParser {
         self.headers_done
     }
 
+    /// Feed head bytes only: how many of `data` the head took once it is complete, the rest being body.
+    pub(crate) fn feed_head(&mut self, data: &[u8]) -> Result<Option<usize>, ParseError> {
+        debug_assert!(!self.headers_done);
+        for (i, &b) in data.iter().enumerate() {
+            self.hdr_state = match (self.hdr_state, b) {
+                (0, b'\r') => 1,
+                (1, b'\n') => 2,
+                (2, b'\r') => 3,
+                (3, b'\n') => 4,
+                (_, b'\r') => 1,
+                _ => 0,
+            };
+            if self.hdr_state == 4 {
+                self.pending.extend_from_slice(&data[..=i]);
+                self.parse_head()?;
+                self.headers_done = true;
+                self.pending = Vec::new();
+                return Ok(Some(i + 1));
+            }
+        }
+        if self.pending.len() + data.len() > MAX_HEAD {
+            return Err(ParseError::HeadTooLong);
+        }
+        self.pending.extend_from_slice(data);
+        Ok(None)
+    }
+
+    /// Body bytes delivered past the parser, by whoever reads them.
+    pub(crate) fn count_body(&mut self, n: u64) {
+        self.body_bytes += n;
+    }
+
     pub(crate) fn feed(&mut self, data: &[u8], sink: &mut dyn BodySink) -> Result<(), ParseError> {
         if self.headers_done {
             self.body_bytes += data.len() as u64;

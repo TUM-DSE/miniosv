@@ -67,6 +67,7 @@ pub struct mininet_config {
     pub workers: u32,
     pub conns_per_worker: u32,
     pub idle_us: u32,
+    pub worker_copies: u32,
 }
 
 /// Mirrors `mininet::response`.
@@ -173,6 +174,12 @@ fn up(cfg: &mininet_config) -> c_int {
         queues: cfg.workers.min(u16::MAX as u32) as u16,
         rx_desc: 0,
         rx_intr: cfg.idle_us != 0,
+        // A jumbo frame's payload per window's worth of 8 KiB, on each of a queue's connections.
+        rx_hold: if cfg.worker_copies != 0 {
+            0
+        } else {
+            cfg.conns_per_worker.max(1) * (ServiceConfig::new(peer.clone()).rx_buffer / 8192) as u32
+        },
         peer: ip,
         resolve: ip.is_none().then_some(host),
     }) {
@@ -183,6 +190,7 @@ fn up(cfg: &mininet_config) -> c_int {
     let mut scfg = ServiceConfig::new(peer);
     scfg.conns_per_worker = cfg.conns_per_worker.max(1) as usize;
     scfg.idle_ns = cfg.idle_us as u64 * 1000;
+    scfg.worker_copies = cfg.worker_copies != 0;
     scfg.resolve = ip.is_none();
     let svc = match Service::start(&stack, &scfg) {
         Ok(s) => s,

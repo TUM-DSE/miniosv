@@ -19,6 +19,7 @@ use crate::device::DpdkDevice;
 use crate::dns;
 use crate::endpoint::Endpoint;
 use crate::error::Error;
+use crate::feed::Feed;
 use crate::http::BodySink;
 use crate::ffi::{rte_pktmbuf_pool, shim_time_seconds};
 use crate::rss::{Rss, EPH_LEN};
@@ -267,6 +268,13 @@ impl Worker {
         }
     }
 
+    /// A request is over: frames and window back, whatever its reader left.
+    pub(crate) fn settle(&mut self, slot: usize) {
+        if let Some(c) = self.conns.get_mut(slot).and_then(|c| c.as_mut()) {
+            c.release_all(&mut self.sockets);
+        }
+    }
+
     pub(crate) fn idle_reusable(&self, slot: usize) -> bool {
         self.conns
             .get(slot)
@@ -275,11 +283,11 @@ impl Worker {
     }
 
     /// Only after [`Worker::idle_reusable`] was just true.
-    pub(crate) fn reuse(&mut self, slot: usize, head: &[u8], sink: Box<dyn BodySink>) -> Result<(), Error> {
+    pub(crate) fn reuse(&mut self, slot: usize, head: &[u8], sink: Box<dyn BodySink>, feed: *const Feed) -> Result<(), Error> {
         let now_ns = self.clk.elapsed_ns();
         match self.conns.get_mut(slot).and_then(|c| c.as_mut()) {
             Some(c) => {
-                c.reset_for(head, sink, now_ns);
+                c.reset_for(head, sink, now_ns, feed);
                 crate::stats::request_started(true);
                 Ok(())
             }
@@ -288,7 +296,7 @@ impl Worker {
     }
 
     /// Open `slot` on the next port in the rotation that no live socket holds.
-    pub fn connect_next(&mut self, slot: usize, head: &[u8], sink: Box<dyn BodySink>) -> Result<(), Error> {
+    pub(crate) fn connect_next(&mut self, slot: usize, head: &[u8], sink: Box<dyn BodySink>, feed: *const Feed) -> Result<(), Error> {
         if self.resolve {
             self.adopt(); // before the port: the rotation is the address's
         }
@@ -309,7 +317,7 @@ impl Worker {
             println!("p{}q{}[{}] every port in the rotation is open", self.port, self.queue_id, slot);
             return Err(Error::ConnectRejected);
         };
-        self.connect_on(slot, src_port, head, sink)
+        self.connect_on(slot, src_port, head, sink, feed)
     }
 
     fn port_in_use(&self, port: u16) -> bool {
@@ -321,7 +329,7 @@ impl Worker {
         })
     }
 
-    fn connect_on(&mut self, slot: usize, src_port: u16, head: &[u8], sink: Box<dyn BodySink>) -> Result<(), Error> {
+    fn connect_on(&mut self, slot: usize, src_port: u16, head: &[u8], sink: Box<dyn BodySink>, feed: *const Feed) -> Result<(), Error> {
         let handle = *self.handles.get(slot).ok_or(Error::ConnectRejected)?;
         let dst = (Ipv4Address::from_octets(self.peer.ip), self.peer.port);
         let dial_start_ns = self.clk.elapsed_ns();
@@ -353,6 +361,8 @@ impl Worker {
             sink,
             bufs,
             now_ns,
+            &*self.dev.current,
+            feed,
         ));
         crate::stats::conn_dialled(now_ns.saturating_sub(dial_start_ns));
         Ok(())

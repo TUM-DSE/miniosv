@@ -1,7 +1,9 @@
 //! A smoltcp `Device` over one minidpdk queue of one port. Nothing is copied
 //! on either path.
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::cell::Cell;
 use core::ffi::c_void;
 use core::ptr;
 
@@ -10,6 +12,7 @@ use smoltcp::time::Instant;
 
 use crate::ffi::{rte_pktmbuf_pool, shim_mbuf_alloc_tx, shim_mbuf_free, shim_mbuf_rx_burst_n, shim_mbuf_tx_burst};
 use crate::rss::OwnedPorts;
+use crate::rx::RxFrame;
 use crate::stats;
 
 /// Ethernet frame size, header included: smoltcp derives ip_mtu (and from it
@@ -54,6 +57,8 @@ pub(crate) struct DpdkDevice {
     tx_handles: [*mut c_void; TX_BATCH],
     tx_lens: [u16; TX_BATCH],
     tx_len: usize,
+    /// The frame smoltcp is in the middle of, for a socket that keeps its payload where it lies.
+    pub(crate) current: Box<Cell<RxFrame>>,
 }
 
 impl DpdkDevice {
@@ -85,6 +90,7 @@ impl DpdkDevice {
             tx_handles: [ptr::null_mut(); TX_BATCH],
             tx_lens: [0; TX_BATCH],
             tx_len: 0,
+            current: Box::new(Cell::new(RxFrame::NONE)),
         }
     }
 
@@ -167,6 +173,7 @@ pub(crate) enum DpdkRxToken {
         handle: *mut c_void,
         data: *const u8,
         len: usize,
+        current: *const Cell<RxFrame>,
     },
     Synth(Vec<u8>),
 }
@@ -179,9 +186,12 @@ impl RxToken for DpdkRxToken {
     fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
         let mut this = core::mem::ManuallyDrop::new(self);
         match &mut *this {
-            DpdkRxToken::Mbuf { handle, data, len } => {
+            DpdkRxToken::Mbuf { handle, data, len, current } => {
                 let slice = unsafe { core::slice::from_raw_parts(*data, *len) };
+                let cur = unsafe { &**current };
+                cur.set(RxFrame { handle: *handle, base: *data, len: *len });
                 let r = f(slice);
+                cur.set(RxFrame::NONE);
                 unsafe { shim_mbuf_free(*handle) };
                 r
             }
@@ -322,7 +332,8 @@ impl Device for DpdkDevice {
             let ok = self.accepts(unsafe { core::slice::from_raw_parts(data, len) });
             if ok {
                 self.rx_budget -= 1;
-                return Some((DpdkRxToken::Mbuf { handle, data, len }, DpdkTxToken { dev: self }));
+                let current: *const Cell<RxFrame> = &*self.current;
+                return Some((DpdkRxToken::Mbuf { handle, data, len, current }, DpdkTxToken { dev: self }));
             }
             unsafe { shim_mbuf_free(handle) };
         }

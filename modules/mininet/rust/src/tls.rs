@@ -48,7 +48,7 @@ pub(crate) fn client_config() -> Arc<ClientConfig> {
     roots
         .add(rustls::pki_types::CertificateDer::from(&include_bytes!(env!("MININET_EXTRA_ROOT"))[..]))
         .expect("rustls: MININET_EXTRA_ROOT is not a usable CA certificate");
-    let cfg = ClientConfig::builder_with_details(
+    let mut cfg = ClientConfig::builder_with_details(
         Arc::new(provider()),
         Arc::new(ShimTimeProvider),
     )
@@ -56,6 +56,8 @@ pub(crate) fn client_config() -> Arc<ClientConfig> {
     .expect("rustls: TLS 1.3")
     .with_root_certificates(roots)
     .with_no_client_auth();
+    // Records past the handshake are this crate's (record.rs), so a reader can decrypt its own body.
+    cfg.enable_secret_extraction = true;
     Arc::new(cfg)
 }
 

@@ -215,6 +215,10 @@ void shim_mbuf_free(void *handle) {
   if (handle) rte_pktmbuf_free(static_cast<rte_mbuf *>(handle));
 }
 
+void shim_mbuf_ref(void *handle) {
+  static_cast<rte_mbuf *>(handle)->refcnt++;
+}
+
 // out: [ipackets, opackets, ibytes, obytes, imissed, ierrors, oerrors, rx_nombuf]
 int shim_eth_stats(uint16_t port_id, uint64_t *out, uint16_t n) {
   rte_eth_dev *dev = lookup_dev(port_id);

@@ -13,6 +13,7 @@ use core::sync::atomic::{fence, AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ato
 
 use crate::endpoint::Endpoint;
 use crate::error::Error;
+use crate::feed::{Feed, Reader, DONE, FAILED};
 use crate::ffi::{
     shim_rx_intr_arm, shim_rx_intr_disarm, shim_thread_current, shim_thread_park, shim_thread_unpark, shim_time_ns,
     shim_waiter_new, shim_waiter_signal, shim_waiter_wait, SHIM_THREAD_BOOST, SHIM_THREAD_RESERVE,
@@ -45,6 +46,8 @@ const RELEASED: u32 = 2;
 /// One request in flight, on the submitting thread's stack. The worker marks
 /// `PUBLISHED`, wakes the submitter, then marks `RELEASED`; the submitter
 /// returns only on `RELEASED`, so the worker never unparks a dead thread.
+/// Until then the submitter may be reading the body out of `feed`, woken
+/// through `signal` while `waiting`.
 struct Slot {
     head: *const u8,
     head_len: usize,
@@ -56,6 +59,9 @@ struct Slot {
     state: AtomicU32,
     next: AtomicPtr<Slot>,
     outcome: UnsafeCell<Option<Result<GetResult, Error>>>,
+    feed: AtomicPtr<Feed>,
+    signal: AtomicU32,
+    waiting: AtomicBool,
 }
 
 impl Slot {
@@ -71,6 +77,9 @@ impl Slot {
             state: AtomicU32::new(RELEASED),
             next: AtomicPtr::new(ptr::null_mut()),
             outcome: UnsafeCell::new(None),
+            feed: AtomicPtr::new(ptr::null_mut()),
+            signal: AtomicU32::new(0),
+            waiting: AtomicBool::new(false),
         }
     }
 
@@ -82,10 +91,35 @@ impl Slot {
         unsafe { *s.outcome.get() = Some(res) };
         s.published_ns.store(unsafe { shim_time_ns() }, Ordering::Relaxed);
         s.state.store(PUBLISHED, Ordering::Release);
+        s.signal.store(1, Ordering::Release);
         if !waiter.is_null() {
             unsafe { shim_thread_unpark(waiter) };
         }
         s.state.store(RELEASED, Ordering::Release);
+    }
+
+    /// The outcome, for a submitter reading a feed: it returns as soon as the feed says the worker let go.
+    ///
+    /// # Safety
+    /// `p` is a slot this worker popped and has not let go of.
+    unsafe fn hand_over(p: *mut Slot, res: Result<GetResult, Error>) {
+        let s = unsafe { &*p };
+        unsafe { *s.outcome.get() = Some(res) };
+        s.published_ns.store(unsafe { shim_time_ns() }, Ordering::Relaxed);
+    }
+
+    /// Wake the submitter if it sleeps waiting for its feed.
+    ///
+    /// # Safety
+    /// `p` is a slot this worker popped and has not released.
+    unsafe fn notify(p: *mut Slot) {
+        let s = unsafe { &*p };
+        // Against the submitter's store of `waiting` and its look at the feed.
+        fence(Ordering::SeqCst);
+        if s.waiting.load(Ordering::Relaxed) {
+            s.signal.store(1, Ordering::Release);
+            unsafe { shim_thread_unpark(s.waiter) };
+        }
     }
 }
 
@@ -131,7 +165,12 @@ impl Queue {
         unsafe { (*slot).next.store(ptr::null_mut(), Ordering::Relaxed) };
         let prev = self.head.swap(slot, Ordering::AcqRel);
         unsafe { (*prev).next.store(slot, Ordering::Release) };
-        // Against the worker's store of `sleeping` and its last look at the queue: one of the two sees the other.
+        self.wake_worker();
+    }
+
+    /// Wake the worker if it sleeps: something to do was published before this.
+    fn wake_worker(&self) {
+        // Against the worker's store of `sleeping` and its last look at its work: one of the two sees the other.
         fence(Ordering::SeqCst);
         if self.sleeping.load(Ordering::Relaxed) {
             let w = self.waiter.load(Ordering::Acquire);
@@ -191,6 +230,8 @@ pub struct ServiceConfig {
     pub resolve: bool,
     /// 0: poll forever on a reserved cpu. Otherwise sleep on the queue's interrupt after this long with nothing to do.
     pub idle_ns: u64,
+    /// The worker writes bodies into callers' buffers; otherwise each caller reads its own out of the frames.
+    pub worker_copies: bool,
 }
 
 impl ServiceConfig {
@@ -202,6 +243,7 @@ impl ServiceConfig {
             tx_buffer: 32 * 1024,
             resolve: false,
             idle_ns: 0,
+            worker_copies: false,
         }
     }
 }
@@ -231,9 +273,10 @@ impl Service {
             let peer = cfg.peer.clone();
             let (conns, rx, tx, resolve) = (cfg.conns_per_worker, cfg.rx_buffer, cfg.tx_buffer, cfg.resolve);
             let idle_ns = cfg.idle_ns;
+            let worker_copies = cfg.worker_copies;
             let flags = if idle_ns == 0 { SHIM_THREAD_RESERVE } else { SHIM_THREAD_BOOST };
             thread::spawn(
-                move || serve(handle, peer, conns, rx, tx, resolve, idle_ns, mine),
+                move || serve(handle, peer, conns, rx, tx, resolve, idle_ns, worker_copies, mine),
                 Some(worker_cpu(q)),
                 flags,
             );
@@ -273,12 +316,78 @@ impl Service {
             state: AtomicU32::new(PENDING),
             next: AtomicPtr::new(ptr::null_mut()),
             outcome: UnsafeCell::new(None),
+            feed: AtomicPtr::new(ptr::null_mut()),
+            signal: AtomicU32::new(0),
+            waiting: AtomicBool::new(false),
         };
 
         let i = self.next.fetch_add(1, Ordering::Relaxed) % self.queues.len();
-        self.queues[i].push(&slot as *const Slot as *mut Slot);
+        let queue = &self.queues[i];
+        queue.push(&slot as *const Slot as *mut Slot);
 
-        unsafe { shim_thread_park(slot.state.as_ptr() as *const u32) };
+        // Read the body out of the feed as it arrives, if the worker gives one, until the worker is done.
+        let (buf_ptr, buf_cap) = (buf.as_mut_ptr(), buf.len());
+        let mut reader: Option<Reader> = None;
+        let mut read_all = false;
+        loop {
+            slot.signal.store(0, Ordering::Relaxed);
+            slot.waiting.store(true, Ordering::Relaxed);
+            fence(Ordering::SeqCst);
+            if slot.state.load(Ordering::Acquire) != PENDING {
+                slot.waiting.store(false, Ordering::Relaxed);
+                break;
+            }
+            let feed = unsafe { slot.feed.load(Ordering::Acquire).as_ref() };
+            // All read: the worker lets go of the slot right after it says it is finished, so wait here rather
+            // than park, and stay on this cpu with the body in its cache.
+            if read_all && feed.is_some_and(|f| f.slot_done()) {
+                slot.waiting.store(false, Ordering::Relaxed);
+                break;
+            }
+            if read_all {
+                slot.waiting.store(false, Ordering::Relaxed);
+                core::hint::spin_loop();
+                continue;
+            }
+            let news = feed.is_some_and(|f| f.has_news());
+            if !news {
+                unsafe { shim_thread_park(slot.signal.as_ptr() as *const u32) };
+            }
+            slot.waiting.store(false, Ordering::Relaxed);
+            if read_all {
+                continue;
+            }
+            let Some(f) = (unsafe { slot.feed.load(Ordering::Acquire).as_ref() }) else { continue };
+            let r = reader.get_or_insert_with(|| Reader::new(f, buf_ptr, buf_cap));
+            let mut wake = r.drain();
+            if f.finished() {
+                r.drain();
+                r.finish();
+                read_all = true;
+                wake = true;
+            }
+            if wake {
+                queue.wake_worker();
+            }
+        }
+        if read_all {
+            let (written, failed, overflowed) = reader.as_ref().expect("read").result();
+            let t1 = unsafe { shim_time_ns() };
+            stats::get_finished(
+                t1.saturating_sub(t0),
+                t1.saturating_sub(slot.published_ns.load(Ordering::Relaxed)),
+                t1,
+            );
+            return match unsafe { (*slot.outcome.get()).take() }.unwrap_or(Err(Error::BadResponse)) {
+                Ok(_) if overflowed => Err(Error::BufferTooSmall),
+                Ok(_) if failed => Err(Error::Tls),
+                Ok(mut g) => {
+                    g.written = written;
+                    Ok(g)
+                }
+                Err(e) => Err(e),
+            };
+        }
         while slot.state.load(Ordering::Acquire) != RELEASED {
             core::hint::spin_loop();
         }
@@ -368,12 +477,17 @@ pub(crate) fn queue_fifo_selftest() -> bool {
     ordered
 }
 
-#[derive(Clone, Copy)]
 struct Pending {
     slot: *mut Slot,
     reused: bool,
     retried: bool,
     picked_ns: u64,
+    /// The slot's, kept here: with a feed the slot may be gone before the stats are taken.
+    submitted_ns: u64,
+    /// Framed: the worker is done, and has this for the slot (no feed), or waits for the reader (a feed).
+    result: Option<Result<GetResult, Error>>,
+    framed: bool,
+    failed: bool,
 }
 
 fn head_of(s: &Slot) -> &[u8] {
@@ -406,6 +520,7 @@ fn serve(
     tx_buffer: usize,
     resolve: bool,
     idle_ns: u64,
+    worker_copies: bool,
     queue: Arc<Queue>,
 ) {
     let queue_id = handle.queue_id();
@@ -431,6 +546,8 @@ fn serve(
     let mut idle_since_ns = unsafe { shim_time_ns() };
 
     let mut pending: Vec<Option<Pending>> = (0..w.slots()).map(|_| None).collect();
+    // A feed per connection: its requester reads the body out of it.
+    let feeds: Vec<Box<Feed>> = if worker_copies { Vec::new() } else { (0..w.slots()).map(|_| Feed::new()).collect() };
     let epoch_ns = w.clock().epoch_ns();
     let mut prev_poll_ns = 0u64;
     let mut prev_busy_ns = 0u64;
@@ -452,69 +569,132 @@ fn serve(
         let mut progress = false;
 
         for slot in 0..w.slots() {
-            let Some(pd) = pending[slot] else {
+            let feed = feeds.get(slot).map(|f| &**f);
+            let feed_ptr = feed.map_or(ptr::null(), |f| f as *const Feed);
+            let Some(pd) = pending[slot].as_mut() else {
                 let Some(p) = queue.pop() else { continue };
                 progress = true;
                 let s = unsafe { &*p };
+                if let Some(f) = feed {
+                    f.reset();
+                }
                 let reused = w.idle_reusable(slot);
                 let opened = if reused {
-                    w.reuse(slot, head_of(s), sink_of(s))
+                    w.reuse(slot, head_of(s), sink_of(s), feed_ptr)
                 } else {
                     // A kept socket the peer since closed sits in CloseWait;
                     // connect() needs Closed.
                     w.release(slot);
-                    w.connect_next(slot, head_of(s), sink_of(s))
+                    w.connect_next(slot, head_of(s), sink_of(s), feed_ptr)
                 };
                 match opened {
                     Ok(()) => {
-                        pending[slot] = Some(Pending { slot: p, reused, retried: false, picked_ns: now_ns });
+                        s.feed.store(feed_ptr as *mut Feed, Ordering::Release);
+                        pending[slot] =
+                            Some(Pending {
+                                slot: p,
+                                reused,
+                                retried: false,
+                                picked_ns: now_ns,
+                                submitted_ns: s.submitted_ns,
+                                result: None,
+                                framed: false,
+                                failed: false,
+                            });
                     }
                     Err(e) => unsafe { Slot::complete(p, Err(e)) },
                 }
                 continue;
             };
-            let Some(step) = w.conn(slot).and_then(|c| c.outcome()) else { continue };
-            progress = true;
-            let res = match step {
-                crate::Step::Complete => result_of(w.conn_mut(slot).expect("just observed")),
-                crate::Step::Failed(e) => Err(e),
-                crate::Step::Pending => unreachable!("outcome() is terminal"),
-            };
-            if matches!(step, crate::Step::Failed(Error::SynTimeout)) {
-                w.dial_failed();
-            }
-            // A reused socket the peer had already closed: re-dial once. GET
-            // and HEAD are safe to repeat.
-            if pd.reused && !pd.retried && matches!(step, crate::Step::Failed(_)) {
-                let s = unsafe { &*pd.slot };
-                w.release(slot);
-                if w.connect_next(slot, head_of(s), sink_of(s)).is_ok() {
-                    stats::request_retried();
-                    pending[slot] = Some(Pending { reused: false, retried: true, ..pd });
+
+            if !pd.framed {
+                let Some(step) = w.conn(slot).and_then(|c| c.outcome()) else {
+                    if feed.is_some_and(|f| f.worth_waking()) {
+                        unsafe { Slot::notify(pd.slot) };
+                    }
+                    continue;
+                };
+                progress = true;
+                let res = match step {
+                    crate::Step::Complete => result_of(w.conn_mut(slot).expect("just observed")),
+                    crate::Step::Failed(e) => Err(e),
+                    crate::Step::Pending => unreachable!("outcome() is terminal"),
+                };
+                if matches!(step, crate::Step::Failed(Error::SynTimeout)) {
+                    w.dial_failed();
+                }
+                // A reused socket the peer had already closed: re-dial once. GET
+                // and HEAD are safe to repeat, while nothing of the answer went out.
+                let untouched = feed.map_or(true, |f| f.produced() == 0)
+                    && w.conn(slot).map_or(true, |c| c.sink_written() == 0);
+                if pd.reused && !pd.retried && matches!(step, crate::Step::Failed(_)) && untouched {
+                    let s = unsafe { &*pd.slot };
+                    w.release(slot);
+                    if let Some(f) = feed {
+                        f.reset();
+                    }
+                    if w.connect_next(slot, head_of(s), sink_of(s), feed_ptr).is_ok() {
+                        stats::request_retried();
+                        pd.reused = false;
+                        pd.retried = true;
+                        continue;
+                    }
+                }
+                // Past the retry, so this one is a real failure: either a fresh
+                // connection died, or the re-dial did not save it.
+                if let crate::Step::Failed(e) = step {
+                    println!(
+                        "FAIL: q{} request failed{}: {:?}",
+                        queue_id,
+                        if pd.retried { " after re-dial" } else { "" },
+                        e
+                    );
+                }
+                pd.framed = true;
+                pd.failed = res.is_err();
+                pd.result = Some(res);
+                // The reader still has the body to read; the slot is its from here on.
+                if let Some(f) = feed {
+                    if f.produced() == 0 {
+                        // The worker wrote whatever body there was.
+                        f.set_base(w.conn(slot).map_or(0, |c| c.sink_written()));
+                    }
+                    let ok = !pd.failed;
+                    unsafe { Slot::hand_over(pd.slot, pd.result.take().expect("just set")) };
+                    f.finish(if ok { DONE } else { FAILED });
+                    unsafe { Slot::notify(pd.slot) };
+                    f.release_slot();
                     continue;
                 }
             }
-            // Past the retry, so this one is a real failure: either a fresh
-            // connection died, or the re-dial did not save it.
-            if let crate::Step::Failed(e) = step {
-                println!(
-                    "FAIL: q{} request failed{}: {:?}",
-                    queue_id,
-                    if pd.retried { " after re-dial" } else { "" },
-                    e
-                );
+
+            // Framed: with a feed, done once the reader has read it all.
+            let mut written = None;
+            if let Some(f) = feed {
+                let Some((n, failed, overflowed)) = f.reader_result() else { continue };
+                progress = true;
+                written = Some(n);
+                if !pd.failed && failed {
+                    println!("FAIL: q{} body did not decrypt", queue_id);
+                }
+                pd.failed |= failed || overflowed;
             }
+            let pd = pending[slot].take().expect("this slot's");
+            // Frames the reader is through with, and anything past the body, go back before the feed is reused.
+            w.settle(slot);
             let head_ns = w.conn(slot).and_then(|c| c.head_ns()).map(|h| h + epoch_ns);
+            let written = written.unwrap_or_else(|| pd.result.as_ref().map_or(0, |r| r.as_ref().map_or(0, |g| g.written)));
             stats::request_finished(
-                pd.picked_ns.saturating_sub(unsafe { (*pd.slot).submitted_ns }),
+                pd.picked_ns.saturating_sub(pd.submitted_ns),
                 now_ns.saturating_sub(pd.picked_ns),
-                res.as_ref().map_or(0, |g| g.written),
+                written,
                 head_ns.map(|h| h.saturating_sub(pd.picked_ns)),
                 head_ns.map(|h| now_ns.saturating_sub(h)),
             );
-            unsafe { Slot::complete(pd.slot, res) };
-            pending[slot] = None;
-            if !w.idle_reusable(slot) {
+            if let Some(res) = pd.result {
+                unsafe { Slot::complete(pd.slot, res) };
+            }
+            if pd.failed || !w.idle_reusable(slot) {
                 w.release(slot);
             }
         }
@@ -523,10 +703,11 @@ fn serve(
             continue;
         }
         let (rxp, txp) = w.last_dev();
-        if progress || rxp != 0 || txp != 0 || w.last_active() || w.rx_buffered() {
+        let reclaimable = feeds.iter().any(|f| f.has_reclaimable());
+        if progress || rxp != 0 || txp != 0 || w.last_active() || w.rx_buffered() || reclaimable {
             idle_since_ns = now_ns;
         } else if now_ns.saturating_sub(idle_since_ns) >= idle_ns {
-            sleep_until_work(&mut w, &queue, waiter, queue_id);
+            sleep_until_work(&mut w, &queue, &feeds, waiter, queue_id);
             idle_since_ns = unsafe { shim_time_ns() };
         }
     }
@@ -537,7 +718,7 @@ const MAX_SLEEP_NS: u64 = 10_000_000;
 
 /// Arm the queue's interrupt and sleep until a packet, a request or smoltcp's next timer. The worker polls once
 /// more after arming: what arrived before the interrupt was armed raised none.
-fn sleep_until_work(w: &mut Worker, queue: &Queue, waiter: *mut c_void, queue_id: u16) {
+fn sleep_until_work(w: &mut Worker, queue: &Queue, feeds: &[Box<Feed>], waiter: *mut c_void, queue_id: u16) {
     let port = w.port();
     queue.sleeping.store(true, Ordering::Relaxed);
     fence(Ordering::SeqCst);
@@ -548,7 +729,7 @@ fn sleep_until_work(w: &mut Worker, queue: &Queue, waiter: *mut c_void, queue_id
     }
     w.poll();
     let (rxp, _) = w.last_dev();
-    if rxp == 0 && !w.rx_buffered() && !queue.maybe_pending() {
+    if rxp == 0 && !w.rx_buffered() && !queue.maybe_pending() && !feeds.iter().any(|f| f.has_reclaimable()) {
         let timeout = w.next_timer_ns().unwrap_or(MAX_SLEEP_NS).min(MAX_SLEEP_NS);
         let t0 = unsafe { shim_time_ns() };
         let signalled = unsafe { shim_waiter_wait(waiter, timeout) } != 0;
