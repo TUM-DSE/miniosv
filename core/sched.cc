@@ -1418,35 +1418,8 @@ void thread::wake_with_irq_disabled()
 
 void thread::wake_lock(mutex* mtx, wait_record* wr)
 {
-    // must be called with mtx held
-#if CONF_lazy_stack_invariant
-    assert(sched::preemptable() && arch::irq_enabled());
-#endif
-#if CONF_lazy_stack
-    arch::ensure_next_stack_page();
-#endif
-    WITH_LOCK(rcu_read_lock) {
-        auto st = _detached_state.get();
-        // We want to send_lock() to this thread, but we want to be sure we're the only
-        // ones doing it, and that it doesn't wake up while we do
-        auto expected = status::waiting;
-        if (!st->st.compare_exchange_strong(expected, status::sending_lock, std::memory_order_relaxed)) {
-            // make sure the thread can see wr->woken() == true.  We're still protected by
-            // the mutex, so so need for extra protection
-            wr->clear();
-            // let the thread acquire the lock itself
-            return;
-        }
-        // Send the lock to the thread, unless someone else already woke the us up,
-        // and we're sleeping in mutex::lock().
-        if (mtx->send_lock_unless_already_waiting(wr)) {
-            st->lock_sent = true;
-        } else {
-            st->st.store(status::waiting, std::memory_order_relaxed);
-            wr->clear();
-        }
-        // since we're in status::sending_lock, no one can wake us except mutex::unlock
-    }
+    // must be called with mtx held; the woken thread takes it once released
+    wr->wake();
 }
 
 bool thread::unsafe_stop()

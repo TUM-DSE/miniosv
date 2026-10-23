@@ -543,12 +543,10 @@ public:
     cpu* get_cpu() const {
         return _detached_state.get()->_cpu;
     }
-    // wake up after acquiring mtx
+    // wake a thread that waits with mtx released; it takes mtx itself
     //
     // mtx must be locked, and wr must be a free wait_record that will
-    // survive until the thread wakes up.  wake_lock() will not cause
-    // the thread to wake up immediately; only when it becomes possible
-    // for it to take the mutex.
+    // survive until the thread wakes up.
     void wake_lock(mutex* mtx, wait_record* wr);
     bool interrupted();
     void interrupted(bool f);
@@ -827,7 +825,6 @@ private:
         explicit detached_state(thread* t) : t(t) {}
         thread* t;
         cpu* _cpu = nullptr;
-        bool lock_sent = false;   // send_lock() was called for us
         std::atomic<status> st = { status::unstarted };
     };
     std::unique_ptr<detached_state> _detached_state;
@@ -1399,12 +1396,7 @@ void thread::do_wait_for(Mutex& mtx, wait_object&&... wait_objects)
             release(mtx);
             me->wait();
         }
-        if (me->_detached_state->lock_sent) {
-            me->_detached_state->lock_sent = false;
-            mtx.receive_lock();
-        } else {
-            acquire(mtx);
-        }
+        acquire(mtx);
     }
     disarm(wait_objects...);
 }

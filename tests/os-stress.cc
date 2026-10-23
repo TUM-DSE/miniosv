@@ -105,6 +105,101 @@ static void test_condvar_queue()
     CHECK(sum.load() == (long)N * (N + 1) / 2);
 }
 
+static void test_mutex_contention()
+{
+    section("threads: mutex lock/trylock/recursive mix with long holders");
+    const int NT = 32, PER = 4000;
+    pthread_mutex_t m;
+    pthread_mutexattr_t a;
+    pthread_mutexattr_init(&a);
+    pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&m, &a);
+    long counter = 0;
+    int inside = 0;
+    std::atomic<int> overlaps{0}, recursion_bad{0};
+    std::vector<std::thread> ts;
+    for (int i = 0; i < NT; i++) {
+        ts.emplace_back([&, i] {
+            unsigned r = i * 2654435761u + 1;
+            for (int j = 0; j < PER; j++) {
+                r = r * 1103515245 + 12345;
+                if ((r >> 16) % 4 == 0) {
+                    while (pthread_mutex_trylock(&m) != 0) {
+                        sched::thread::yield();
+                    }
+                } else {
+                    pthread_mutex_lock(&m);
+                }
+                if (inside++ != 0) {
+                    overlaps++;
+                }
+                if ((r >> 20) % 8 == 0) {
+                    if (pthread_mutex_lock(&m) != 0 || pthread_mutex_trylock(&m) != 0) {
+                        recursion_bad++;
+                    }
+                    pthread_mutex_unlock(&m);
+                    pthread_mutex_unlock(&m);
+                }
+                counter++;
+                /* Now and then a long hold, so waiters sleep long enough to ask for a handoff. */
+                if ((r >> 24) % 64 == 0) {
+                    for (int k = 0; k < 20000; k++) {
+                        __builtin_ia32_pause();
+                    }
+                }
+                inside--;
+                pthread_mutex_unlock(&m);
+            }
+        });
+    }
+    for (auto &t : ts) t.join();
+    CHECK(overlaps.load() == 0);
+    CHECK(recursion_bad.load() == 0);
+    CHECK(counter == (long)NT * PER);
+    CHECK(pthread_mutex_trylock(&m) == 0);
+    pthread_mutex_unlock(&m);
+    pthread_mutex_destroy(&m);
+}
+
+static void test_condvar_timed()
+{
+    section("threads: condition_variable timed waits racing notify_one/notify_all");
+    std::mutex m;
+    std::condition_variable cv;
+    long pending = 0, consumed = 0;
+    bool done = false;
+    const int NC = 8, N = 40000;
+    std::vector<std::thread> cs;
+    for (int i = 0; i < NC; i++) {
+        cs.emplace_back([&] {
+            std::unique_lock<std::mutex> lk(m);
+            for (;;) {
+                while (pending == 0 && !done) {
+                    cv.wait_for(lk, std::chrono::microseconds(50));
+                }
+                if (pending == 0) {
+                    break;
+                }
+                pending--;
+                consumed++;
+            }
+        });
+    }
+    for (int i = 0; i < N; i++) {
+        { std::lock_guard<std::mutex> lk(m); pending++; }
+        if (i % 7 == 0) {
+            cv.notify_all();
+        } else {
+            cv.notify_one();
+        }
+    }
+    { std::lock_guard<std::mutex> lk(m); done = true; }
+    cv.notify_all();
+    for (auto &t : cs) t.join();
+    CHECK(consumed == N);
+    CHECK(pending == 0);
+}
+
 static void test_async_futures()
 {
     section("threads: std::async / std::future fan-out");
@@ -323,6 +418,8 @@ int os_stress_main()
     test_threads_atomic();
     test_threads_mutex();
     test_condvar_queue();
+    test_mutex_contention();
+    test_condvar_timed();
     test_async_futures();
     test_thread_local();
     test_pthread_barrier();
