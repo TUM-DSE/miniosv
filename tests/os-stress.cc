@@ -35,6 +35,8 @@
 #include <algorithm>
 
 #include <osv/sched.hh>
+#include <osv/semaphore.hh>
+#include <semaphore.h>
 
 static std::atomic<int> g_checks{0};
 static std::atomic<int> g_fails{0};
@@ -198,6 +200,62 @@ static void test_condvar_timed()
     for (auto &t : cs) t.join();
     CHECK(consumed == N);
     CHECK(pending == 0);
+}
+
+static void test_semaphore_timed()
+{
+    section("threads: sem_post racing sem_timedwait timeouts");
+    const int NP = 8, NW = 8, PER = 20000;
+    sem_t s;
+    CHECK(sem_init(&s, 0, 0) == 0);
+    std::atomic<long> taken{0}, timeouts{0};
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> ws, ps;
+    for (int i = 0; i < NW; i++) {
+        ws.emplace_back([&] {
+            while (!stop.load()) {
+                struct timespec ts;
+                clock_gettime(CLOCK_REALTIME, &ts);
+                ts.tv_nsec += 20000;
+                if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
+                if (sem_timedwait(&s, &ts) == 0) {
+                    taken++;
+                } else {
+                    timeouts++;
+                }
+            }
+        });
+    }
+    for (int i = 0; i < NP; i++) {
+        ps.emplace_back([&] { for (int j = 0; j < PER; j++) sem_post(&s); });
+    }
+    for (auto &t : ps) t.join();
+    while (taken.load() < (long)NP * PER) {
+        sched::thread::yield();
+    }
+    stop = true;
+    for (auto &t : ws) t.join();
+    CHECK(taken.load() == (long)NP * PER);
+    CHECK(sem_trywait(&s) != 0);
+    sem_destroy(&s);
+    printf("    (%ld timeouts)\n", timeouts.load());
+}
+
+static void test_semaphore_units()
+{
+    section("threads: multi-unit semaphore waits fed by single posts");
+    const int NW = 6, ROUNDS = 3000, UNITS = 3;
+    semaphore s{0};
+    std::atomic<long> got{0};
+    std::vector<std::thread> ws;
+    for (int i = 0; i < NW; i++) {
+        ws.emplace_back([&] { for (int j = 0; j < ROUNDS; j++) { s.wait(UNITS); got += UNITS; } });
+    }
+    std::thread poster([&] { for (long j = 0; j < (long)NW * ROUNDS * UNITS; j++) s.post(); });
+    poster.join();
+    for (auto &t : ws) t.join();
+    CHECK(got.load() == (long)NW * ROUNDS * UNITS);
+    CHECK(!s.trywait());
 }
 
 static void test_async_futures()
@@ -420,6 +478,8 @@ int os_stress_main()
     test_condvar_queue();
     test_mutex_contention();
     test_condvar_timed();
+    test_semaphore_timed();
+    test_semaphore_units();
     test_async_futures();
     test_thread_local();
     test_pthread_barrier();
