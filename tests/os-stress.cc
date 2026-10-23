@@ -32,6 +32,11 @@
 #include <pthread.h>
 #include <sys/mman.h>
 #include <time.h>
+#include <algorithm>
+
+#include <osv/sched.hh>
+#include <osv/semaphore.hh>
+#include <semaphore.h>
 
 static std::atomic<int> g_checks{0};
 static std::atomic<int> g_fails{0};
@@ -100,6 +105,157 @@ static void test_condvar_queue()
     cv.notify_one();
     consumer.join();
     CHECK(sum.load() == (long)N * (N + 1) / 2);
+}
+
+static void test_mutex_contention()
+{
+    section("threads: mutex lock/trylock/recursive mix with long holders");
+    const int NT = 32, PER = 4000;
+    pthread_mutex_t m;
+    pthread_mutexattr_t a;
+    pthread_mutexattr_init(&a);
+    pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&m, &a);
+    long counter = 0;
+    int inside = 0;
+    std::atomic<int> overlaps{0}, recursion_bad{0};
+    std::vector<std::thread> ts;
+    for (int i = 0; i < NT; i++) {
+        ts.emplace_back([&, i] {
+            unsigned r = i * 2654435761u + 1;
+            for (int j = 0; j < PER; j++) {
+                r = r * 1103515245 + 12345;
+                if ((r >> 16) % 4 == 0) {
+                    while (pthread_mutex_trylock(&m) != 0) {
+                        sched::thread::yield();
+                    }
+                } else {
+                    pthread_mutex_lock(&m);
+                }
+                if (inside++ != 0) {
+                    overlaps++;
+                }
+                if ((r >> 20) % 8 == 0) {
+                    if (pthread_mutex_lock(&m) != 0 || pthread_mutex_trylock(&m) != 0) {
+                        recursion_bad++;
+                    }
+                    pthread_mutex_unlock(&m);
+                    pthread_mutex_unlock(&m);
+                }
+                counter++;
+                /* Now and then a long hold, so waiters sleep long enough to ask for a handoff. */
+                if ((r >> 24) % 64 == 0) {
+                    for (int k = 0; k < 20000; k++) {
+                        __builtin_ia32_pause();
+                    }
+                }
+                inside--;
+                pthread_mutex_unlock(&m);
+            }
+        });
+    }
+    for (auto &t : ts) t.join();
+    CHECK(overlaps.load() == 0);
+    CHECK(recursion_bad.load() == 0);
+    CHECK(counter == (long)NT * PER);
+    CHECK(pthread_mutex_trylock(&m) == 0);
+    pthread_mutex_unlock(&m);
+    pthread_mutex_destroy(&m);
+}
+
+static void test_condvar_timed()
+{
+    section("threads: condition_variable timed waits racing notify_one/notify_all");
+    std::mutex m;
+    std::condition_variable cv;
+    long pending = 0, consumed = 0;
+    bool done = false;
+    const int NC = 8, N = 40000;
+    std::vector<std::thread> cs;
+    for (int i = 0; i < NC; i++) {
+        cs.emplace_back([&] {
+            std::unique_lock<std::mutex> lk(m);
+            for (;;) {
+                while (pending == 0 && !done) {
+                    cv.wait_for(lk, std::chrono::microseconds(50));
+                }
+                if (pending == 0) {
+                    break;
+                }
+                pending--;
+                consumed++;
+            }
+        });
+    }
+    for (int i = 0; i < N; i++) {
+        { std::lock_guard<std::mutex> lk(m); pending++; }
+        if (i % 7 == 0) {
+            cv.notify_all();
+        } else {
+            cv.notify_one();
+        }
+    }
+    { std::lock_guard<std::mutex> lk(m); done = true; }
+    cv.notify_all();
+    for (auto &t : cs) t.join();
+    CHECK(consumed == N);
+    CHECK(pending == 0);
+}
+
+static void test_semaphore_timed()
+{
+    section("threads: sem_post racing sem_timedwait timeouts");
+    const int NP = 8, NW = 8, PER = 20000;
+    sem_t s;
+    CHECK(sem_init(&s, 0, 0) == 0);
+    std::atomic<long> taken{0}, timeouts{0};
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> ws, ps;
+    for (int i = 0; i < NW; i++) {
+        ws.emplace_back([&] {
+            while (!stop.load()) {
+                struct timespec ts;
+                clock_gettime(CLOCK_REALTIME, &ts);
+                ts.tv_nsec += 20000;
+                if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
+                if (sem_timedwait(&s, &ts) == 0) {
+                    taken++;
+                } else {
+                    timeouts++;
+                }
+            }
+        });
+    }
+    for (int i = 0; i < NP; i++) {
+        ps.emplace_back([&] { for (int j = 0; j < PER; j++) sem_post(&s); });
+    }
+    for (auto &t : ps) t.join();
+    while (taken.load() < (long)NP * PER) {
+        sched::thread::yield();
+    }
+    stop = true;
+    for (auto &t : ws) t.join();
+    CHECK(taken.load() == (long)NP * PER);
+    CHECK(sem_trywait(&s) != 0);
+    sem_destroy(&s);
+    printf("    (%ld timeouts)\n", timeouts.load());
+}
+
+static void test_semaphore_units()
+{
+    section("threads: multi-unit semaphore waits fed by single posts");
+    const int NW = 6, ROUNDS = 3000, UNITS = 3;
+    semaphore s{0};
+    std::atomic<long> got{0};
+    std::vector<std::thread> ws;
+    for (int i = 0; i < NW; i++) {
+        ws.emplace_back([&] { for (int j = 0; j < ROUNDS; j++) { s.wait(UNITS); got += UNITS; } });
+    }
+    std::thread poster([&] { for (long j = 0; j < (long)NW * ROUNDS * UNITS; j++) s.post(); });
+    poster.join();
+    for (auto &t : ws) t.join();
+    CHECK(got.load() == (long)NW * ROUNDS * UNITS);
+    CHECK(!s.trywait());
 }
 
 static void test_async_futures()
@@ -210,7 +366,7 @@ static void test_mmap_anon()
     for (size_t i = 0; i < SZ; i += 4096) if (m[i] != 0xA5) ok = false;
     CHECK(ok);
     CHECK(mprotect(p, SZ, PROT_READ) == 0);          /* make read-only */
-    CHECK(madvise(p, SZ, MADV_DONTNEED) == 0 || errno == EINVAL);
+    CHECK(madvise(p, SZ, MADV_DONTNEED) == 0);
     CHECK(munmap(p, SZ) == 0);
 }
 
@@ -271,6 +427,48 @@ static void test_time_sched()
     CHECK(errors.load() == 0);
 }
 
+/* A burst of threads spreads over the cpus, and a reserved cpu gets none of them. */
+static void test_sched_placement()
+{
+    section("sched: placement spreads a burst, and skips a reserved cpu");
+    const unsigned n = sched::cpus.size();
+    if (n < 2) { CHECK(true); return; }
+
+    auto burst = [n](std::vector<unsigned> &where) {
+        std::mutex m;
+        std::atomic<unsigned> started{0};
+        std::atomic<bool> go{false};
+        std::vector<std::thread> ts;
+        for (unsigned i = 0; i < 4 * n; i++)
+            ts.emplace_back([&] {
+                unsigned c = sched::cpu::current()->id;
+                { std::lock_guard<std::mutex> g(m); where.push_back(c); }
+                started++;
+                while (!go.load()) sched_yield();   /* stay runnable, so load counts */
+            });
+        while (started.load() < 4 * n) sched_yield();
+        go = true;
+        for (auto &t : ts) t.join();
+    };
+    auto distinct = [](std::vector<unsigned> w) {
+        std::sort(w.begin(), w.end());
+        return std::unique(w.begin(), w.end()) - w.begin();
+    };
+
+    std::vector<unsigned> where;
+    burst(where);
+    CHECK(distinct(where) >= 2);
+
+    CHECK(sched::reserve_cpu(n - 1));
+    CHECK(sched::reserve_cpu(n - 1));                       /* again is fine */
+    where.clear();
+    burst(where);
+    CHECK(std::count(where.begin(), where.end(), n - 1) == 0);
+
+    for (unsigned c = 1; c + 1 < n; c++) CHECK(sched::reserve_cpu(c));
+    CHECK(!sched::reserve_cpu(0));                          /* the last free cpu stays free */
+}
+
 int os_stress_main()
 {
     printf("==== OSv OS-interaction stress tests ====\n");
@@ -278,6 +476,10 @@ int os_stress_main()
     test_threads_atomic();
     test_threads_mutex();
     test_condvar_queue();
+    test_mutex_contention();
+    test_condvar_timed();
+    test_semaphore_timed();
+    test_semaphore_units();
     test_async_futures();
     test_thread_local();
     test_pthread_barrier();
@@ -287,6 +489,7 @@ int os_stress_main()
     test_mmap_concurrent();
 
     test_time_sched();
+    test_sched_placement();
 
     printf("\n==== os-stress: %d checks, %d failures ====\n",
            g_checks.load(), g_fails.load());

@@ -108,10 +108,9 @@ inline unsigned n_cpus()
 }
 
 // Runs fn(i) on `threads` threads started together; returns the wall time.
-// Each thread is pinned to its own cpu: without that they all stay on the cpu
-// that created them, since the load balancer runs every 100 ms, far longer
-// than a measurement, and a scaling run would measure one core sharing its
-// time N ways -- which looks exactly like a global lock.
+// Each thread is pinned to its own cpu: placement spreads a burst by load,
+// which is advisory, and nothing moves a thread afterwards, so a scaling run
+// could measure two threads sharing a core -- which looks like a global lock.
 template <typename F>
 double parallel(unsigned threads, F fn)
 {

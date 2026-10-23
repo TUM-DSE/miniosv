@@ -457,13 +457,12 @@ void cpu::idle_poll_end()
     std::atomic_thread_fence(std::memory_order_seq_cst);
 }
 
+// Ungated on runqueue length: a busy cpu would leave the wake to the preemption timer.
+// force: a real-time thread running there has no timer and reschedules only when it blocks.
 void cpu::send_wakeup_ipi(bool force)
 {
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    // A busy cpu with more than one thread queued is left to its preemption
-    // timer -- unless the wake-up must be seen at once: a real-time thread
-    // running there has no timer and reschedules only when it blocks.
-    if (force || (!idle_poll.load(std::memory_order_relaxed) && runqueue.size() <= 1)) {
+    if (force || !idle_poll.load(std::memory_order_relaxed)) {
         trace_sched_ipi(id);
         wakeup_ipi.send(this);
     }
@@ -514,10 +513,49 @@ void cpu::idle()
     }
 
     while (true) {
+        idling.store(true, std::memory_order_relaxed);
         do_idle();
+        idling.store(false, std::memory_order_relaxed);
         // We have idle priority, so this runs the thread on the runqueue:
         schedule();
     }
+}
+
+// The next idle, unreserved cpu after `from`, or nullptr. Claimed: the flag
+// is cleared here, so two wakeups in the same microsecond take two cpus.
+static cpu *idle_cpu_after(unsigned from)
+{
+    unsigned n = cpus.size();
+    for (unsigned i = 1; i < n; i++) {
+        cpu *c = cpus[(from + i) % n];
+        bool idle = true;
+        if (!c->reserved.load(std::memory_order_relaxed) &&
+            c->idling.compare_exchange_strong(idle, false, std::memory_order_relaxed)) {
+            return c;
+        }
+    }
+    return nullptr;
+}
+
+static cpu *placement_cpu();
+
+// Where a thread waking up here should run instead, if this cpu is busy
+// with another thread and one idles, or its owner has it back. Nullptr keeps
+// it here.
+cpu *cpu::forward_to(thread &t)
+{
+    if (!t.migratable() || t.pinned()) {
+        return nullptr;
+    }
+    if (reserved.load(std::memory_order_relaxed)) {
+        cpu *alt = idle_cpu_after(id) ?: placement_cpu();
+        return alt == this ? nullptr : alt;
+    }
+    thread *cur = thread::current();
+    if (cur == idle_thread || cur->_detached_state->st.load(std::memory_order_relaxed) != thread::status::running) {
+        return nullptr;
+    }
+    return idle_cpu_after(id);
 }
 
 void cpu::handle_incoming_wakeups()
@@ -543,6 +581,26 @@ void cpu::handle_incoming_wakeups()
                 } else if (t.tcpu() != this) {
                     // Thread was woken on the wrong cpu. Can be a side-effect
                     // of sched::thread::pin(thread*, cpu*). Do nothing.
+                } else if (cpu *alt = forward_to(t)) {
+                    // This cpu is busy and another idles: the thread would
+                    // wait out a slice here. Done on the cpu whose timer list
+                    // holds the thread, the only place that can.
+                    trace_sched_migrate(&t, alt->id);
+                    t.stat_migrations.incr();
+                    t.suspend_timers();
+                    // The thread may have slept across this cpu's
+                    // renormalization: bring its local runtime up to date
+                    // first, as the enqueue branch below does: a stale value
+                    // overflowed the destination's rescale to infinity, which
+                    // ties with the idle thread and trips n!=p at reschedule.
+                    t._runtime.update_after_sleep();
+                    t._runtime.export_runtime();
+                    t._detached_state->_cpu = alt;
+                    t.remote_thread_local_var(::percpu_base) = alt->percpu_base;
+                    t.remote_thread_local_var(current_cpu) = alt;
+                    alt->incoming_wakeups[id].push_back(t);
+                    alt->incoming_wakeups_mask.set(id);
+                    alt->send_wakeup_ipi();
                 } else {
                     t._detached_state->st.store(thread::status::queued);
                     // Make sure the CPU-local runtime measure is suitably
@@ -576,15 +634,84 @@ void cpu::enqueue_first_equal(thread& t)
     runqueue.insert_before(runqueue.lower_bound(t), t);
 }
 
+// Cpus that have run init_on_cpu(); `sched::cpus` is populated long before.
+static std::atomic<unsigned> cpus_running;
+
 void cpu::init_on_cpu()
 {
     arch.init_on_cpu();
     clock_event->setup_on_cpu();
+    cpus_running.fetch_add(1, std::memory_order_release);
 }
 
 unsigned cpu::load()
 {
     return runqueue.size();
+}
+
+static std::atomic<unsigned> cpus_reserved;
+
+// A spinning owner is running, not queued, so placement thinks its cpu is empty.
+bool reserve_cpu(unsigned id)
+{
+    if (id >= cpus.size()) {
+        return false;
+    }
+    if (cpus[id]->reserved.load(std::memory_order_relaxed)) {
+        return true;
+    }
+    if (cpus_reserved.load(std::memory_order_relaxed) + 1 >= cpus.size()) {
+        return false;
+    }
+    cpus_reserved.fetch_add(1, std::memory_order_relaxed);
+    cpus[id]->reserved.store(true, std::memory_order_release);
+
+    thread *t = thread::current();
+    if (t->tcpu() == cpus[id] && !t->pinned()) {
+        cpu *dst = placement_cpu();
+        if (dst != cpus[id]) {
+            t->pin(dst);
+            t->unpin();
+        }
+    }
+    return true;
+}
+
+void lend_cpu(unsigned id, bool lent)
+{
+    if (id < cpus.size()) {
+        cpus[id]->reserved.store(!lent, std::memory_order_release);
+    }
+}
+
+static bool available(cpu *c)
+{
+    return !c->reserved.load(std::memory_order_acquire);
+}
+
+// Least-loaded from a rotating offset, since a pool is created while every runqueue is empty.
+static cpu *placement_cpu()
+{
+    if (cpus.size() <= 1 ||
+        cpus_running.load(std::memory_order_acquire) != cpus.size()) {
+        return thread::current()->tcpu();
+    }
+    static std::atomic<unsigned> rotor;
+    unsigned start = rotor.fetch_add(1, std::memory_order_relaxed);
+    cpu *best = nullptr;
+    unsigned best_load = ~0u;
+    for (unsigned i = 0; i < cpus.size(); i++) {
+        cpu *c = cpus[(start + i) % cpus.size()];
+        if (!available(c)) {
+            continue;
+        }
+        unsigned l = c->load();
+        if (l < best_load) {
+            best_load = l;
+            best = c;
+        }
+    }
+    return best ?: thread::current()->tcpu();
 }
 
 // function to pin the *current* thread:
@@ -606,9 +733,8 @@ void thread::pin(cpu *target_cpu)
     }
     // We want to wake this thread on the target CPU, but can't do this while
     // it is still running on this CPU. So we need a different thread to
-    // complete the wakeup. We could re-used an existing thread (e.g., the
-    // load balancer thread) but a "good-enough" dirty solution is to
-    // temporarily create a new ad-hoc thread, "wakeme".
+    // complete the wakeup. A "good-enough" dirty solution is to temporarily
+    // create a new ad-hoc thread, "wakeme".
     bool do_wakeme = false;
     thread_unique_ptr wakeme(thread::make_unique([&] () {
         wait_until([&] { return do_wakeme; });
@@ -649,8 +775,7 @@ void thread::pin(thread *t, cpu *target_cpu)
     }
     // To work on the target thread, we need to run code on the same CPU on
     // where the target thread is currently running. We start here a new
-    // helper thread to follow the target thread's CPU. We could have also
-    // re-used an existing thread (e.g., the load balancer thread).
+    // helper thread to follow the target thread's CPU.
     thread_unique_ptr helper(thread::make_unique([&] {
 #if CONF_lazy_stack_invariant
         assert(!thread::current()->is_app());
@@ -796,10 +921,7 @@ void thread::unpin()
 
 void cpu::on_cpu_up()
 {
-    // fire the per-cpu "cpu up" notifiers 
-    // - clock per-CPU setup 
-    // This must run on the CPU being brought up, since the callbacks 
-    // iniitialize cpu::current()'s per-CPU state
+    // Must run on the cpu being brought up: the callbacks set up per-cpu state.
     notifier::fire();
 }
 cpu::notifier::notifier(std::function<void ()> cpu_up)
@@ -1167,7 +1289,7 @@ void thread::start()
         return;
     }
 
-    _detached_state->_cpu = _attr._pinned_cpu ? _attr._pinned_cpu : current()->tcpu();
+    _detached_state->_cpu = _attr._pinned_cpu ? _attr._pinned_cpu : placement_cpu();
     remote_thread_local_var(percpu_base) = _detached_state->_cpu->percpu_base;
     remote_thread_local_var(current_cpu) = _detached_state->_cpu;
     _detached_state->st.store(status::waiting);
@@ -1296,35 +1418,8 @@ void thread::wake_with_irq_disabled()
 
 void thread::wake_lock(mutex* mtx, wait_record* wr)
 {
-    // must be called with mtx held
-#if CONF_lazy_stack_invariant
-    assert(sched::preemptable() && arch::irq_enabled());
-#endif
-#if CONF_lazy_stack
-    arch::ensure_next_stack_page();
-#endif
-    WITH_LOCK(rcu_read_lock) {
-        auto st = _detached_state.get();
-        // We want to send_lock() to this thread, but we want to be sure we're the only
-        // ones doing it, and that it doesn't wake up while we do
-        auto expected = status::waiting;
-        if (!st->st.compare_exchange_strong(expected, status::sending_lock, std::memory_order_relaxed)) {
-            // make sure the thread can see wr->woken() == true.  We're still protected by
-            // the mutex, so so need for extra protection
-            wr->clear();
-            // let the thread acquire the lock itself
-            return;
-        }
-        // Send the lock to the thread, unless someone else already woke the us up,
-        // and we're sleeping in mutex::lock().
-        if (mtx->send_lock_unless_already_waiting(wr)) {
-            st->lock_sent = true;
-        } else {
-            st->st.store(status::waiting, std::memory_order_relaxed);
-            wr->clear();
-        }
-        // since we're in status::sending_lock, no one can wake us except mutex::unlock
-    }
+    // must be called with mtx held; the woken thread takes it once released
+    wr->wake();
 }
 
 bool thread::unsafe_stop()

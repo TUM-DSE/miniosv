@@ -1,0 +1,362 @@
+//! A smoltcp `Device` over one minidpdk queue of one port. Nothing is copied
+//! on either path.
+
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use core::cell::Cell;
+use core::ffi::c_void;
+use core::ptr;
+
+use smoltcp::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use smoltcp::time::Instant;
+
+use crate::ffi::{rte_pktmbuf_pool, shim_mbuf_alloc_tx, shim_mbuf_free, shim_mbuf_rx_burst_n, shim_mbuf_tx_burst};
+use crate::rss::OwnedPorts;
+use crate::rx::RxFrame;
+use crate::stats;
+
+/// Ethernet frame size, header included: smoltcp derives ip_mtu (and from it
+/// the MSS it advertises) by subtracting the 14-byte header. 9015 = 9001 + 14.
+pub(crate) const MTU: usize = 9015;
+/// What the NIC and smoltcp both call the MTU: the frame minus its header.
+pub(crate) const IP_MTU: usize = MTU - 14;
+
+/// RX drains up to this many mbufs per burst.
+pub(crate) const RX_BURST: usize = 32;
+const TX_BATCH: usize = 32;
+/// Flush attempts before a frame is dropped because the ring never took the
+/// batch: each is a doorbell plus a completion sweep, so this is milliseconds.
+const TX_FULL_SPINS: u32 = 10_000;
+
+pub(crate) struct DpdkDevice {
+    /// The NIC this queue belongs to; one per ENI on EC2.
+    pub(crate) port: u16,
+    pub(crate) queue_id: u16,
+    pub(crate) pool: *mut rte_pktmbuf_pool,
+    /// One fabricated frame, seeding the neighbour cache with the gateway's MAC.
+    pub(crate) pending_synth: Option<Vec<u8>>,
+    /// Ports this queue owns; `None` accepts everything (the DHCP/ARP phase on queue 0).
+    /// A TCP frame for a port not owned is a prediction failure and is counted.
+    pub(crate) owned_ports: Option<OwnedPorts>,
+    rx_pref_handles: [*mut c_void; RX_BURST],
+    rx_pref_data: [*const u8; RX_BURST],
+    rx_pref_lens: [u16; RX_BURST],
+    rx_pref_pos: u16,
+    rx_pref_len: u16,
+    rx_pkts: u64,
+    tx_pkts: u64,
+    /// Frame sizes, batched into stats every `kFrameFlush` frames so the
+    /// counters never touch a shared line per frame.
+    rx_jumbo_pkts: u64,
+    rx_jumbo_bytes: u64,
+    rx_len_max: u16,
+    rx_seen: u32,
+    /// Frames `receive` may still hand out in this poll; the worker refills it before each one.
+    pub(crate) rx_budget: u32,
+    /// Frames written but not yet handed to the NIC: one doorbell per flush, not per frame.
+    tx_handles: [*mut c_void; TX_BATCH],
+    tx_lens: [u16; TX_BATCH],
+    tx_len: usize,
+    /// The frame smoltcp is in the middle of, for a socket that keeps its payload where it lies.
+    pub(crate) current: Box<Cell<RxFrame>>,
+}
+
+impl DpdkDevice {
+    pub(crate) fn new(
+        port: u16,
+        queue_id: u16,
+        pool: *mut rte_pktmbuf_pool,
+        owned_ports: Option<OwnedPorts>,
+        pending_synth: Option<Vec<u8>>,
+    ) -> Self {
+        Self {
+            port,
+            queue_id,
+            pool,
+            pending_synth,
+            owned_ports,
+            rx_pref_handles: [ptr::null_mut(); RX_BURST],
+            rx_pref_data: [ptr::null(); RX_BURST],
+            rx_pref_lens: [0; RX_BURST],
+            rx_pref_pos: 0,
+            rx_pref_len: 0,
+            rx_pkts: 0,
+            tx_pkts: 0,
+            rx_jumbo_pkts: 0,
+            rx_jumbo_bytes: 0,
+            rx_len_max: 0,
+            rx_seen: 0,
+            rx_budget: u32::MAX,
+            tx_handles: [ptr::null_mut(); TX_BATCH],
+            tx_lens: [0; TX_BATCH],
+            tx_len: 0,
+            current: Box::new(Cell::new(RxFrame::NONE)),
+        }
+    }
+
+    /// Hand the batched frames to the NIC. What the ring will not take stays
+    /// at the front of the batch for the next flush: a poll that ACKs a few
+    /// thousand segments at once outruns a 1024-entry ring, and dropping the
+    /// rest cost the sender its ACKs.
+    pub fn flush_tx(&mut self) {
+        if self.tx_len == 0 {
+            return;
+        }
+        let sent = unsafe {
+            shim_mbuf_tx_burst(self.port, self.queue_id, self.tx_handles.as_mut_ptr(), self.tx_lens.as_ptr(), self.tx_len as u16)
+        } as usize;
+        self.tx_pkts += sent as u64;
+        let held = self.tx_len - sent;
+        if held > 0 {
+            stats::tx_held(held as u64);
+            self.tx_handles.copy_within(sent..self.tx_len, 0);
+            self.tx_lens.copy_within(sent..self.tx_len, 0);
+        }
+        self.tx_len = held;
+    }
+
+    /// Packets received and transmitted since the last call.
+    /// Frames fetched from the ring but not yet handed to smoltcp (the poll budget ran out).
+    pub(crate) fn has_buffered(&self) -> bool {
+        self.rx_pref_pos < self.rx_pref_len
+    }
+
+    pub fn take_counts(&mut self) -> (u64, u64) {
+        let r = (self.rx_pkts, self.tx_pkts);
+        self.rx_pkts = 0;
+        self.tx_pkts = 0;
+        r
+    }
+
+    /// True if the frame should be passed up.
+    pub(crate) fn accepts(&self, bytes: &[u8]) -> bool {
+        let owned = match &self.owned_ports {
+            Some(o) => o,
+            None => return true,
+        };
+        // Ethernet(14) + IPv4(20) + TCP(20) = 54.
+        if bytes.len() < 54 {
+            return true;
+        }
+        if bytes[12] != 0x08 || bytes[13] != 0x00 {
+            return true; // not IPv4
+        }
+        let ihl = (bytes[14] & 0x0f) as usize * 4;
+        let l4 = 14 + ihl;
+        if bytes[23] != 6 /* TCP */ || l4 + 4 > bytes.len() {
+            return true;
+        }
+        let dst_port = ((bytes[l4 + 2] as u16) << 8) | (bytes[l4 + 3] as u16);
+        if owned.contains(dst_port) {
+            true
+        } else {
+            stats::misrouted_drop();
+            false
+        }
+    }
+}
+
+/// The NIC writes frames to memory, not cache: without this, each header read is a miss to DRAM.
+const RX_PREFETCH_AHEAD: usize = 4;
+
+fn prefetch_header(p: *const u8) {
+    // Ethernet, IPv4 and TCP with options can cross into a second line.
+    unsafe {
+        use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+        _mm_prefetch(p as *const i8, _MM_HINT_T0);
+        _mm_prefetch(p.wrapping_add(64) as *const i8, _MM_HINT_T0);
+    }
+}
+
+pub(crate) enum DpdkRxToken {
+    Mbuf {
+        handle: *mut c_void,
+        data: *const u8,
+        len: usize,
+        current: *const Cell<RxFrame>,
+    },
+    Synth(Vec<u8>),
+}
+
+pub(crate) struct DpdkTxToken<'a> {
+    dev: &'a mut DpdkDevice,
+}
+
+impl RxToken for DpdkRxToken {
+    fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
+        let mut this = core::mem::ManuallyDrop::new(self);
+        match &mut *this {
+            DpdkRxToken::Mbuf { handle, data, len, current } => {
+                let slice = unsafe { core::slice::from_raw_parts(*data, *len) };
+                let cur = unsafe { &**current };
+                cur.set(RxFrame { handle: *handle, base: *data, len: *len });
+                let r = f(slice);
+                cur.set(RxFrame::NONE);
+                unsafe { shim_mbuf_free(*handle) };
+                r
+            }
+            DpdkRxToken::Synth(buf) => f(&buf[..]),
+        }
+    }
+}
+
+impl Drop for DpdkDevice {
+    fn drop(&mut self) {
+        self.flush_tx();
+    }
+}
+
+impl Drop for DpdkRxToken {
+    fn drop(&mut self) {
+        if let DpdkRxToken::Mbuf { handle, .. } = *self {
+            unsafe { shim_mbuf_free(handle) };
+        }
+    }
+}
+
+impl TxToken for DpdkTxToken<'_> {
+    fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
+        // The token that comes with a received frame cannot be refused, so a
+        // full batch has to be pushed into the ring here. The ring drains by
+        // DMA at its own pace; wait on it briefly rather than lose the frame.
+        let mut spins = 0u32;
+        while self.dev.tx_len == TX_BATCH && spins < TX_FULL_SPINS {
+            self.dev.flush_tx();
+            spins += 1;
+            core::hint::spin_loop();
+        }
+        if self.dev.tx_len == TX_BATCH {
+            // Still full: the NIC is not taking anything. Count it as a drop
+            // with the no-mbuf ones; smoltcp still wants `f` called.
+            stats::tx_alloc_fail();
+            let mut scratch = [0u8; MTU];
+            let n = core::cmp::min(len, scratch.len());
+            return f(&mut scratch[..n]);
+        }
+        let mut handle: *mut c_void = ptr::null_mut();
+        let mut cap: u16 = 0;
+        let data = unsafe { shim_mbuf_alloc_tx(self.dev.pool, self.dev.queue_id, &mut handle, &mut cap) };
+        if data.is_null() || handle.is_null() {
+            // Pool exhausted: smoltcp still wants `f` called; count the discarded frame.
+            stats::tx_alloc_fail();
+            let mut scratch = [0u8; MTU];
+            let n = core::cmp::min(len, scratch.len());
+            return f(&mut scratch[..n]);
+        }
+        let n = core::cmp::min(len, cap as usize);
+        let slice = unsafe { core::slice::from_raw_parts_mut(data, n) };
+        let r = f(slice);
+        self.dev.tx_handles[self.dev.tx_len] = handle;
+        self.dev.tx_lens[self.dev.tx_len] = n as u16;
+        self.dev.tx_len += 1;
+        if self.dev.tx_len == TX_BATCH {
+            self.dev.flush_tx();
+        }
+        r
+    }
+}
+
+impl DpdkDevice {
+    /// Push the batched frame-size counters into stats. At most 1023 frames a
+    /// queue are still local when a run ends, out of hundreds of thousands.
+    fn flush_frame_stats(&mut self) {
+        stats::rx_frames(self.rx_jumbo_pkts, self.rx_jumbo_bytes, self.rx_len_max);
+        self.rx_jumbo_pkts = 0;
+        self.rx_jumbo_bytes = 0;
+        self.rx_seen = 0;
+    }
+}
+
+impl Device for DpdkDevice {
+    type RxToken<'a>
+        = DpdkRxToken
+    where
+        Self: 'a;
+    type TxToken<'a>
+        = DpdkTxToken<'a>
+    where
+        Self: 'a;
+
+    fn receive(&mut self, _t: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        if let Some(buf) = self.pending_synth.take() {
+            return Some((DpdkRxToken::Synth(buf), DpdkTxToken { dev: self }));
+        }
+        // smoltcp drains every received frame before it sends anything; under load that holds the ACKs back for
+        // milliseconds. The rest stay prefetched for the next poll.
+        if self.rx_budget == 0 {
+            return None;
+        }
+        loop {
+            if self.rx_pref_pos == self.rx_pref_len {
+                let got = unsafe {
+                    shim_mbuf_rx_burst_n(
+                        self.port,
+                        self.queue_id,
+                        self.rx_pref_handles.as_mut_ptr(),
+                        self.rx_pref_data.as_mut_ptr(),
+                        self.rx_pref_lens.as_mut_ptr(),
+                        RX_BURST as u16,
+                    )
+                };
+                self.rx_pkts += got as u64;
+                if got == 0 {
+                    self.flush_tx();
+                    return None;
+                }
+                self.rx_pref_pos = 0;
+                self.rx_pref_len = got;
+                for k in 0..core::cmp::min(got as usize, RX_PREFETCH_AHEAD) {
+                    prefetch_header(self.rx_pref_data[k]);
+                }
+            }
+            let i = self.rx_pref_pos as usize;
+            self.rx_pref_pos += 1;
+            if i + RX_PREFETCH_AHEAD < self.rx_pref_len as usize {
+                prefetch_header(self.rx_pref_data[i + RX_PREFETCH_AHEAD]);
+            }
+            let handle = self.rx_pref_handles[i];
+            let data = self.rx_pref_data[i];
+            let len = self.rx_pref_lens[i] as usize;
+            // Frame size, counted before `accepts` so this matches what the
+            // NIC delivered. Over 1514 is impossible at a 1500-byte MTU.
+            if len > 1514 {
+                self.rx_jumbo_pkts += 1;
+                self.rx_jumbo_bytes += len as u64;
+            }
+            self.rx_len_max = self.rx_len_max.max(len as u16);
+            self.rx_seen += 1;
+            if self.rx_seen >= 1024 {
+                self.flush_frame_stats();
+            }
+
+            let ok = self.accepts(unsafe { core::slice::from_raw_parts(data, len) });
+            if ok {
+                self.rx_budget -= 1;
+                let current: *const Cell<RxFrame> = &*self.current;
+                return Some((DpdkRxToken::Mbuf { handle, data, len, current }, DpdkTxToken { dev: self }));
+            }
+            unsafe { shim_mbuf_free(handle) };
+        }
+    }
+
+    /// `None` while the batch is full and the ring will not drain it: smoltcp
+    /// then keeps the frame for its next poll instead of losing it.
+    fn transmit(&mut self, _t: Instant) -> Option<Self::TxToken<'_>> {
+        if self.tx_len == TX_BATCH {
+            self.flush_tx();
+            if self.tx_len == TX_BATCH {
+                return None;
+            }
+        }
+        Some(DpdkTxToken { dev: self })
+    }
+
+    fn capabilities(&self) -> DeviceCapabilities {
+        let mut c = DeviceCapabilities::default();
+        c.max_transmission_unit = MTU;
+        c.medium = Medium::Ethernet;
+        // The NIC handles L3/L4 checksums; don't pay the CPU cost twice.
+        c.checksum = ChecksumCapabilities::ignored();
+        c
+    }
+}

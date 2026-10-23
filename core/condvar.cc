@@ -84,14 +84,9 @@ int condvar::wait(mutex* user_mutex, sched::timer* tmr)
         }
     }
 
-    if (wr.woken()) {
-        // Our wr was woken. The "wait morphing" protocol used by
-        // condvar_wake*() ensures that this only happens after we got the
-        // user_mutex for ourselves, so no need to mutex_lock() here.
-        user_mutex->receive_lock();
-    } else {
-        user_mutex->lock();
-    }
+    // A woken waiter takes the mutex like anybody else: handing it over
+    // while we are not yet running would hold up every other thread.
+    user_mutex->lock();
 
     return ret;
 }
@@ -113,10 +108,7 @@ void condvar::wake_one()
         if (wr->next == nullptr) {
             _waiters_fifo.newest = nullptr;
         }
-        // Rather than wake the waiter here (wr->wake()) and have it wait
-        // again for the mutex, we do "wait morphing" - have it continue to
-        // sleep until the mutex becomes available.
-        _user_mutex->send_lock(wr);
+        wr->wake();
         // To help the assert() in condvar_wait(), we need to zero saved
         // user_mutex when all concurrent condvar_wait()s are done.
         if (!_waiters_fifo.oldest) {
@@ -138,33 +130,13 @@ void condvar::wake_all()
 
     // To help the assert() in condvar_wait(), we need to zero saved
     // user_mutex when all concurrent condvar_wait()s are done.
-    auto user_mutex = _user_mutex;
     _user_mutex = nullptr;
 
     _waiters_fifo.oldest = _waiters_fifo.newest = nullptr;
     _m.unlock();
     while (wr) {
         auto next_wr = wr->next; // need to save - *wr invalid after wake
-        auto cpu_wr = wr->thread()->tcpu();
-        user_mutex->send_lock(wr);
-        // As an optimization for many threads to wake up on relatively few
-        // CPUs, queue all the threads that will likely wake on the same CPU
-        // one after another, as same-CPU wakeup is faster.
-        wait_record *prevr = nullptr;
-        for (auto r = next_wr; r;) {
-            auto nextr = r->next;
-            if (r->thread()->tcpu() == cpu_wr) {
-                user_mutex->send_lock(r);
-                if (r == next_wr) {
-                    next_wr = nextr;
-                } else {
-                    prevr->next = nextr;
-                }
-            } else {
-                prevr = r;
-            }
-            r = nextr;
-        }
+        wr->wake();
         wr = next_wr;
     }
 }

@@ -52,12 +52,13 @@
         };
 
         # What this fork adds to every shell: e2fsprogs, for the miniext
-        # staging scripts.
+        # staging scripts, and cargo and rustc, for modules/mininet (a Rust
+        # crate every x64 image builds).
         srg =
           shell:
           shell.overrideAttrs (
             old:
-            { nativeBuildInputs = [ pkgs.e2fsprogs ] ++ old.nativeBuildInputs; } // crossFirmware
+            { nativeBuildInputs = [ pkgs.e2fsprogs pkgs.cargo pkgs.rustc ] ++ old.nativeBuildInputs; } // crossFirmware
           );
 
         # The vaccel QEMU, for modules/vaccel. Kept off the `build` shell:

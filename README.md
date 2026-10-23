@@ -8,8 +8,9 @@ OSv is a full-featured, Linux-compatible unikernel: ELF loader, syscall ABI, ZFS
 a networking stack, loadable modules, and a GNU/musl toolchain. miniosv strips all of that away
 to expose the smallest core that still boots and runs a real program — a single statically-linked
 binary where the kernel and the application are compiled together, booted diskless, with no
-syscall layer, no filesystem, and no networking. The goal is understanding and experimentation,
-not Linux compatibility.
+syscall layer. What filesystem and networking there is, modules/miniext and modules/mininet,
+the application calls directly. The goal is understanding and experimentation, not Linux
+compatibility.
 
 ## What's left
 

@@ -77,6 +77,11 @@ cp "$CONFIG_SRC/config.json"     "$ARCH_CONF/config.json"
 # Codegen must match the kernel (see COMMON in the top-level Makefile):
 # non-PIE, no stack protector, local-exec TLS, keep frame pointers.
 KERNEL_FLAGS="-fno-pie -fno-stack-protector -ftls-model=local-exec -fno-omit-frame-pointer"
+# Copies of a KiB and up use rep movsb: the CPUs this targets (Zen 4/5, Ice Lake on) have fast short rep movsb, and
+# the generic loop is SSE2, 16 bytes at a time.
+if [ "$1" = "x64" ]; then
+    KERNEL_FLAGS="$KERNEL_FLAGS -DLIBC_COPT_MEMCPY_X86_USE_REPMOVSB_FROM_SIZE=1024"
+fi
 
 mkdir -p "$BUILD_DIR"
 echo "  LLVM-LIBC configure..."

@@ -80,6 +80,9 @@ uint32_t page_get();
 // Give a page back. The caller must be the last one to hold an object in it.
 void page_put(uint32_t i);
 
+// Release up to "count" empty pages: frames back at once, addresses quarantined.
+bool release_some(uint32_t count);
+
 // Make a page just taken from the window ready to hold objects of "size".
 inline void page_init(uint32_t i, size_t size)
 {

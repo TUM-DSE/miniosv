@@ -42,8 +42,8 @@ namespace pci {
         u64 get_addr64() { return _addr_64; }
         u64 get_size() { return _addr_size; }
 
-        // map mmio region
-        void map();
+        // map mmio region; wc for a BAR written in bursts and never read
+        void map(mem::mattr ma = mem::mattr::normal);
         void unmap();
         bool is_mapped();
         mmioaddr_t get_mmio();

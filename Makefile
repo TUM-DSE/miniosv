@@ -154,6 +154,18 @@ conf_fs_miniext=1
 conf_nvme_max_queue_depth=16
 conf_pagecache_stats=0
 
+# --- network ---------------------------------------------------------------
+# mininet is a minimal HTTP client stack the application calls directly
+# (modules/mininet/mininet.hh). There is no socket layer. It drives the NIC
+# itself, so it needs conf_drivers_ena or conf_drivers_iavf, and like the
+# drivers it is x64 only: the crate is built for the host. Apps link it via
+# mininet.mk.
+ifeq ($(arch),x64)
+conf_net_mininet=1
+else
+conf_net_mininet=0
+endif
+
 # --- threads / stacks ------------------------------------------------------
 conf_threads_default_kernel_stack_size=65536
 conf_threads_default_pthread_stack_size=0x100000
@@ -162,8 +174,19 @@ conf_interrupt_stack_size=0x2000
 # --- device drivers --------------------------------------------------------
 conf_drivers_acpi=1
 conf_drivers_pci=1
-# Off until the ENA port is brought up to the current memory and PCI APIs.
+# The ENA NIC, which modules/mininet drives. x64 only: it sits on x64 MSI-X.
+ifeq ($(arch),x64)
+conf_drivers_ena=1
+else
 conf_drivers_ena=0
+endif
+# Intel's adaptive virtual function (an SR-IOV VF of an E810 or X710), from
+# DPDK's iavf PMD. x64 only, like ENA.
+ifeq ($(arch),x64)
+conf_drivers_iavf=1
+else
+conf_drivers_iavf=0
+endif
 conf_drivers_nvme=1
 # vAccel needs virtio transport drivers (bus, vring, PCI).
 conf_drivers_virtio=1
@@ -178,6 +201,13 @@ conf_lros=1
 ifeq ($(conf_fs_miniext),1)
 ifneq ($(conf_drivers_nvme),1)
 $(error conf_fs_miniext=1 needs conf_drivers_nvme=1)
+endif
+endif
+
+ifeq ($(conf_net_mininet),1)
+ifneq ($(conf_drivers_ena)$(conf_drivers_iavf),00)
+else
+$(error conf_net_mininet=1 needs conf_drivers_ena=1 or conf_drivers_iavf=1)
 endif
 endif
 
@@ -360,8 +390,16 @@ $(out)/libc/%.o: source-dialects =
 # do not hide symbols in libc because it has its own hiding mechanism
 
 kernel-defines = -D_KERNEL $(source-dialects) \
+	-DCONF_drivers_acpi=$(conf_drivers_acpi) \
+	-DCONF_drivers_pci=$(conf_drivers_pci) \
+	-DCONF_drivers_ena=$(conf_drivers_ena) \
+	-DCONF_drivers_iavf=$(conf_drivers_iavf) \
+	-DCONF_drivers_nvme=$(conf_drivers_nvme) \
+	-DCONF_drivers_virtio=$(conf_drivers_virtio) \
+	-DCONF_drivers_virtio_accel=$(conf_drivers_virtio_accel) \
 	-DCONF_fs_miniext=$(conf_fs_miniext) \
 	-DCONF_memory_histogram=$(conf_memory_histogram) \
+	-DCONF_net_mininet=$(conf_net_mininet) \
 	-DCONF_nvme_max_queue_depth=$(conf_nvme_max_queue_depth) \
 	-DCONF_pagecache_stats=$(conf_pagecache_stats)
 
@@ -575,6 +613,15 @@ drivers += drivers/enav2/base/ena_eth_com.o
 drivers += drivers/enav2/base/ena_com.o
 drivers += drivers/enav2/ena_ethdev.o
 drivers += drivers/enav2/ena_rss.o
+endif
+ifeq ($(conf_drivers_iavf),1)
+drivers += drivers/iavf/base/iavf_adminq.o
+drivers += drivers/iavf/base/iavf_common.o
+drivers += drivers/iavf/base/iavf_osdep.o
+drivers += drivers/iavf/iavf.o
+drivers += drivers/iavf/iavf_ethdev.o
+drivers += drivers/iavf/iavf_vchnl.o
+drivers += drivers/iavf/iavf_rxtx.o
 endif
 drivers += drivers/driver.o
 
@@ -1059,8 +1106,8 @@ perhaps-modify-version-h:
 	$(call quiet, sh scripts/gen-version-header $(out)/gen/include/osv/version.h, GEN gen/include/osv/version.h)
 .PHONY: perhaps-modify-version-h
 
-# The CONF_drivers_* macros used by source code (e.g. arch-setup.cc) are frozen
-# in the checked-in include/osv/drivers_config.h; nothing is generated here.
+# The CONF_drivers_* macros reach the code through kernel-defines above;
+# include/osv/drivers_config.h only holds defaults for a compile outside make.
 
 $(out)/gen/include/bits/alltypes.h: include/api/$(arch)/bits/alltypes.h.sh
 	$(makedir)

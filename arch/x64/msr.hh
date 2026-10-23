@@ -57,6 +57,7 @@ enum class msr : uint32_t {
     X2APIC_SELF_IPI = 0x83f,
 
     IA32_APIC_BASE = 0x0000001b,
+    IA32_PAT = 0x00000277,
     IA32_EFER = 0xc0000080,
     IA32_STAR = 0xc0000081,
     IA32_LSTAR = 0xc0000082,

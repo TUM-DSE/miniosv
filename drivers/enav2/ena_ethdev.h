@@ -88,6 +88,7 @@
 
 extern struct ena_shared_data *ena_shared_data;
 
+namespace sched { class thread; }
 struct ena_adapter;
 
 #define ERR
@@ -334,6 +335,11 @@ struct __rte_cache_aligned ena_adapter {
   alignas(RTE_CACHE_LINE_SIZE) struct ena_ring rx_ring[ENA_MAX_NUM_QUEUES];
 
   struct ena_irq irq_tbl[ENA_MAX_MSIX_VEC(ENA_MAX_NUM_IO_QUEUES)];
+  /* Admin completions and AENQ events are handled on this thread, woken by
+   * the management vector's handler. */
+  sched::thread *mgmnt_thread;
+  std::atomic<bool> mgmnt_pending;
+  std::atomic<bool> mgmnt_stop;
   int msix_vecs;
 
   u32 max_rx_ring_size;

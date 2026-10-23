@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <vector>
 
+#include <osv/clock.hh>
 #include <osv/interrupt.hh>
 #include <osv/mem/mapping.hh>
 #include <osv/migration-lock.hh>
@@ -51,11 +52,16 @@ static mutex flush_mutex;
 static sched::thread_handle flush_waiter;
 static std::atomic<int> flush_pendingconfirms;
 
+// Shootdown accounting, read by the tpch driver: how many, how long each
+// waits for the mutex, how long the round trip to every cpu takes.
+std::atomic<uint64_t> shootdowns, shootdown_lock_ns, shootdown_ipi_ns, shootdown_ipi_ns_max;
+
 // List of addresses to flush.
 static std::atomic<const uintptr_t *> flush_va;
 static std::atomic<size_t> flush_va_count;
 
 static inter_processor_interrupt flush_ipi{IPI_TLB_FLUSH, [] {
+        sched::cpu::current()->tlb_ipis.fetch_add(1, std::memory_order_relaxed);
         auto *va = flush_va.load(std::memory_order_acquire);
         if (va) {
             tlb_flush_pages(va, flush_va_count.load(std::memory_order_relaxed));
@@ -86,7 +92,9 @@ static void shootdown(const uintptr_t *va, size_t count)
     }
 
     SCOPE_LOCK(migration_lock);
+    auto t0 = osv::clock::uptime::now();
     std::lock_guard<mutex> guard(flush_mutex);
+    auto t1 = osv::clock::uptime::now();
     flush_waiter.reset(*sched::thread::current());
     // Every cpu, whatever it runs: kernel memory is unmapped and reused too
     // (the heap gives its pages back), so a cpu running a kernel thread may
@@ -104,6 +112,14 @@ static void shootdown(const uintptr_t *va, size_t count)
             return flush_pendingconfirms.load() == 0;
     });
     flush_waiter.clear();
+    auto t2 = osv::clock::uptime::now();
+    uint64_t lock_ns = (t1 - t0).count(), ipi_ns = (t2 - t1).count();
+    shootdowns.fetch_add(1, std::memory_order_relaxed);
+    shootdown_lock_ns.fetch_add(lock_ns, std::memory_order_relaxed);
+    shootdown_ipi_ns.fetch_add(ipi_ns, std::memory_order_relaxed);
+    uint64_t m = shootdown_ipi_ns_max.load(std::memory_order_relaxed);
+    while (ipi_ns > m && !shootdown_ipi_ns_max.compare_exchange_weak(m, ipi_ns)) {
+    }
 }
 
 void tlb_flush_all()

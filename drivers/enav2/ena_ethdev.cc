@@ -961,8 +961,7 @@ static int ena_queue_start(struct rte_eth_dev *dev, ena_ring *ring) {
   if (ring->type == ENA_RING_TYPE_TX) {
     ring->tx_stats.available_desc = ena_com_free_q_entries(ring->ena_com_io_sq);
     return 0;
-  } else if (dev->data.dev_conf.intr_conf.rxq) {
-    assert(ring->handler);
+  } else if (dev->data.dev_conf.intr_conf.rxq && ring->handler) {
     ring->should_stop.store(false, std::memory_order_release);
     ring->intr_thread = sched::thread::make(
         [ring, dev]() { ena_rx_cleanup(ring, dev, ring->handler); });
@@ -1343,7 +1342,9 @@ static int ena_set_queues_placement_policy(
   /* Nothing to config, exit */
   if (ena_dev->tx_mem_queue_type == ENA_ADMIN_PLACEMENT_POLICY_HOST)
     return 0;
-  adapter->dev_mem->map();
+  // The LLQ BAR takes each frame's 128-byte entry as a burst of stores;
+  // write-combined they leave as one transaction, uncached as sixteen.
+  adapter->dev_mem->map(mem::mattr::wc);
   ena_dev->mem_bar = const_cast<void *>(adapter->dev_mem->get_mmio());
 
   return 0;
@@ -1945,6 +1946,21 @@ err_start_tx:
   return rc;
 }
 
+/* The queue's interrupt stays masked after it fires until it is unmasked again, so arming is unmasking and a polled
+ * queue needs nothing to disarm. */
+int ena_eth_dev::rx_intr_enable(uint16_t qid) {
+  if (!data.dev_conf.intr_conf.rxq || qid >= data.nb_rx_queues)
+    return -ENOTSUP;
+  ena_rx_queue_intr_set(&get<ena_adapter>()->rx_ring[qid], true);
+  return 0;
+}
+
+int ena_eth_dev::rx_intr_disable(uint16_t qid) {
+  if (!data.dev_conf.intr_conf.rxq || qid >= data.nb_rx_queues)
+    return -ENOTSUP;
+  return 0;
+}
+
 int ena_eth_dev::stop() {
   ena_adapter *adapter = get<ena_adapter>();
   ena_com_dev *ena_dev = &adapter->ena_dev;
@@ -2436,9 +2452,10 @@ int ena_attach(pci::device *dev, ena_adapter **_adapter) {
 
   /* Assign default devargs values */
   adapter->missing_tx_completion_to = ENA_TX_TIMEOUT;
-  // LLQ is ENA's TX fast path: the descriptor + inline header is
-  // written to the device via a single MMIO burst into the LLQ BAR,
-  // rather than a descriptor+DMA round-trip. Cuts per-TX-packet CPU.
+  // LLQ is ENA's TX fast path: the descriptor and inline header go straight
+  // into the device BAR, mapped write-combining (ena_device_init). Uncached
+  // that cost ~3.5 us a frame; host-memory queues instead (2026-09-17) made
+  // the device's completion rate the ceiling, ~25 Gbps on 8 and 16 queues.
   adapter->llq_header_policy = ENA_LLQ_POLICY_RECOMMENDED;
 
   rc = ena_com_allocate_customer_metrics_buffer(ena_dev);
@@ -2647,11 +2664,29 @@ static void ena_rx_queue_intr_set(ena_ring *rx_ring, bool unmask,
   ena_com_unmask_intr(rx_ring->ena_com_io_cq, &intr_reg);
 }
 
+/* Admin completions and AENQ events, on a thread of their own: both signal
+ * waiters through a sleeping mutex, which an interrupt context may not take.
+ */
+static void ena_mgmnt_work(ena_adapter *adapter) {
+  while (true) {
+    sched::thread::current()->wait_for([adapter] {
+      return adapter->mgmnt_pending.load(std::memory_order_acquire) ||
+             adapter->mgmnt_stop.load(std::memory_order_acquire);
+    });
+    if (adapter->mgmnt_stop.load(std::memory_order_acquire))
+      return;
+    adapter->mgmnt_pending.store(false, std::memory_order_release);
+    ena_com_admin_q_comp_intr_handler(&adapter->ena_dev);
+    if (likely(adapter->state == ENA_ADAPTER_STATE_RUNNING))
+      ena_com_aenq_intr_handler(&adapter->ena_dev, adapter);
+  }
+}
+
 static void ena_intr_msix_mgmnt(void *arg) {
   struct ena_adapter *adapter = static_cast<ena_adapter *>(arg);
-  ena_com_admin_q_comp_intr_handler(&adapter->ena_dev);
-  if (likely(adapter->state == ENA_ADAPTER_STATE_RUNNING))
-    ena_com_aenq_intr_handler(&adapter->ena_dev, arg);
+  adapter->mgmnt_pending.store(true, std::memory_order_release);
+  if (adapter->mgmnt_thread)
+    adapter->mgmnt_thread->wake();
 }
 
 static int ena_enable_msix(ena_adapter *adapter) {
@@ -2678,12 +2713,15 @@ static int ena_enable_msix(ena_adapter *adapter) {
   return (0);
 }
 
+/* A callback queue wakes the driver's thread; a polled one wakes whoever armed it (rx_intr_enable). */
 static void ena_handle_msix(ena_ring *rx_ring) {
   rx_ring->interrupts++;
   rx_ring->rx_pkts_ready.store(true, std::memory_order_release);
   auto *t = rx_ring->intr_thread;
   if (t)
     t->wake_with_irq_disabled();
+  else
+    rx_ring->adapter->edev->rx_wake(rx_ring->id);
 }
 
 static int ena_request_io_irq(struct ena_adapter *adapter) {
@@ -2781,6 +2819,13 @@ static int ena_request_mgmnt_irq(ena_adapter *adapter) {
     return (ENXIO);
   }
 
+  // Only now, with the vector set up and still masked: a failure above
+  // would otherwise leave the thread running with nothing to wake it.
+  adapter->mgmnt_stop.store(false, std::memory_order_release);
+  adapter->mgmnt_pending.store(false, std::memory_order_release);
+  adapter->mgmnt_thread = sched::thread::make([adapter]() { ena_mgmnt_work(adapter); });
+  adapter->mgmnt_thread->start();
+
   ena_irq *irq = &adapter->irq_tbl[ENA_MGMNT_IRQ_IDX];
   irq->vector = ENA_MGMNT_IRQ_IDX;
   irq->mvec = vec;
@@ -2802,6 +2847,13 @@ static void ena_disable_msix(struct ena_adapter *adapter) {
 static void ena_free_irqs(ena_adapter *adapter) {
   if (adapter->irq_tbl[ENA_MGMNT_IRQ_IDX].mvec)
     delete adapter->irq_tbl[ENA_MGMNT_IRQ_IDX].mvec;
+  if (sched::thread *t = adapter->mgmnt_thread) {
+    adapter->mgmnt_stop.store(true, std::memory_order_release);
+    t->wake();
+    t->join();
+    sched::thread::dispose(t);
+    adapter->mgmnt_thread = nullptr;
+  }
   ena_disable_msix(adapter);
 }
 

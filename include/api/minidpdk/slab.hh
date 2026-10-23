@@ -184,7 +184,10 @@ using mbuf_ptr = std::unique_ptr<mbuf, decltype(&mbuf_free)>;
 class mem_pool {
 public:
   static constexpr size_t kDefaultHeadroom = 128;
-  static constexpr size_t kMaxDataLen = 1500 + 36;
+  // EC2's jumbo MTU is 9001, so the largest frame is 9015. Rounded up so that
+  // kMaxDataLen + kDefaultHeadroom stays a multiple of 64 and kDefaultSize
+  // keeps its cache-line alignment.
+  static constexpr size_t kMaxDataLen = 9216;
   static constexpr size_t kDefaultSize =
       kMaxDataLen + kDefaultHeadroom + sizeof(mbuf) + sizeof(obj_header);
   static_assert(kDefaultSize % 64  == 0, "");

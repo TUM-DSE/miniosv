@@ -543,12 +543,10 @@ public:
     cpu* get_cpu() const {
         return _detached_state.get()->_cpu;
     }
-    // wake up after acquiring mtx
+    // wake a thread that waits with mtx released; it takes mtx itself
     //
     // mtx must be locked, and wr must be a free wait_record that will
-    // survive until the thread wakes up.  wake_lock() will not cause
-    // the thread to wake up immediately; only when it becomes possible
-    // for it to take the mutex.
+    // survive until the thread wakes up.
     void wake_lock(mutex* mtx, wait_record* wr);
     bool interrupted();
     void interrupted(bool f);
@@ -827,7 +825,6 @@ private:
         explicit detached_state(thread* t) : t(t) {}
         thread* t;
         cpu* _cpu = nullptr;
-        bool lock_sent = false;   // send_lock() was called for us
         std::atomic<status> st = { status::unstarted };
     };
     std::unique_ptr<detached_state> _detached_state;
@@ -837,8 +834,8 @@ private:
     // is true, it was permanently incremented by 1 by sched::thread::pin().
     // In the future, we should replace this boolean _pinned by a bitmask
     // of allowed cpus for this thread (for full support of
-    // sched_setaffinity()), and the load balancer should consult this bitmask
-    // to decide to which cpus a thread may migrate.
+    // sched_setaffinity()), which placement and wakeup forwarding would
+    // consult to decide to which cpus a thread may go.
     bool _pinned;
     arch_thread _arch;
     unsigned int _id;
@@ -1006,6 +1003,11 @@ struct cpu : private timer_base::client {
     thread* idle_thread;
     // if true, cpu is now polling incoming_wakeups_mask
     std::atomic<bool> idle_poll = { false };
+    // if true, a pinned thread owns this cpu and unpinned ones keep off it
+    std::atomic<bool> reserved = { false };
+    // true while the idle thread runs here, so a waker can send its thread elsewhere
+    std::atomic<bool> idling = { false };
+    std::atomic<uint64_t> tlb_ipis = { 0 };
     // the real-time priority of the thread running here (0: an ordinary
     // one), for a waker to see whether its thread must interrupt this cpu
     std::atomic<unsigned> running_rt_priority = { 0 };
@@ -1020,6 +1022,7 @@ struct cpu : private timer_base::client {
     void init_on_cpu();
     static void schedule();
     void handle_incoming_wakeups();
+    cpu *forward_to(thread &t);
     bool poll_wakeup_queue();
     void idle();
     void do_idle();
@@ -1393,12 +1396,7 @@ void thread::do_wait_for(Mutex& mtx, wait_object&&... wait_objects)
             release(mtx);
             me->wait();
         }
-        if (me->_detached_state->lock_sent) {
-            me->_detached_state->lock_sent = false;
-            mtx.receive_lock();
-        } else {
-            acquire(mtx);
-        }
+        acquire(mtx);
     }
     disarm(wait_objects...);
 }
@@ -1531,6 +1529,13 @@ timer::timer(thread& t)
 }
 
 extern std::vector<cpu*> cpus;
+
+// Keep unpinned threads off `id`; refuses to reserve the last free cpu.
+bool reserve_cpu(unsigned id);
+
+// For an owner that only sometimes needs `id`: reserved while it does, and
+// threads waking there go elsewhere; lent, the cpu is anyone's.
+void lend_cpu(unsigned id, bool lent);
 
 inline void migrate_disable()
 {
