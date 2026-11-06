@@ -249,6 +249,91 @@ void clear_dirty(range r, pending_invalidation &stale)
     }
 }
 
+static bool pte_any(pte)
+{
+    return true;
+}
+
+/*
+ * Report "bit" for every page of "r" as a bitmap, in one walk. "without" takes
+ * the bit away from each leaf that had it, which is what a sweep wants.
+ */
+static size_t scan_leaves(range r, bool (*bit)(pte), pte (*without)(pte),
+                          uint64_t *bits, size_t nbits, pending_invalidation *stale)
+{
+    r = page_align(r);
+    size_t pages = std::min(r.size() >> page_size_shift, nbits);
+    for (size_t w = 0; w < (pages + 63) / 64; ++w) {
+        bits[w] = 0;
+    }
+    if (!pages) {
+        return 0;
+    }
+
+    walk_opts o{false, false, false, max_leaf_level};
+    walk_range({r.start, r.start + (pages << page_size_shift)}, o,
+               [&](pte_ref e, uintptr_t va) {
+        pte old = e.read();
+        if (!pte_present(old) || !bit(old)) {
+            return true;
+        }
+        // A leaf larger than the range covers may start before it.
+        uintptr_t from = va > r.start ? va : r.start;
+        size_t first = (from - r.start) >> page_size_shift;
+        size_t n = (va + e.size() - from) >> page_size_shift;
+        for (size_t i = first; i < first + n && i < pages; ++i) {
+            bits[i / 64] |= uint64_t(1) << (i % 64);
+        }
+
+        while (without && pte_present(old) && bit(old)) {
+            pte now = without(old);
+            if (now == old) {
+                break;
+            }
+            if (e.compare_exchange(old, now)) {
+                if (stale) {
+                    stale->add(va);
+                }
+                break;
+            }
+        }
+        return true;
+    });
+    pte_barrier();
+    if (stale) {
+        stale->epoch = flush_epoch();
+    }
+    return pages;
+}
+
+size_t accessed_bits(range r, uint64_t *bits, size_t nbits)
+{
+    return scan_leaves(r, pte_accessed, nullptr, bits, nbits, nullptr);
+}
+
+size_t dirty_bits(range r, uint64_t *bits, size_t nbits)
+{
+    return scan_leaves(r, tracks_writes ? pte_dirty : pte_any, nullptr, bits, nbits,
+                       nullptr);
+}
+
+size_t clear_accessed_bits(range r, uint64_t *bits, size_t nbits,
+                           pending_invalidation &stale)
+{
+    return scan_leaves(r, pte_accessed,
+                       [](pte e) { return pte_set_accessed(e, false); }, bits, nbits,
+                       &stale);
+}
+
+size_t clear_dirty_bits(range r, uint64_t *bits, size_t nbits,
+                        pending_invalidation &stale)
+{
+    if (!tracks_writes) {
+        return scan_leaves(r, pte_any, nullptr, bits, nbits, nullptr);
+    }
+    return scan_leaves(r, pte_dirty, without_dirty, bits, nbits, &stale);
+}
+
 void split(range r)
 {
     walk_opts o{false, true, false, 0};

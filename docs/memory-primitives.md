@@ -60,6 +60,7 @@ constexpr size_t max_block_bytes = 2 MiB;
 | Function | Does |
 |---|---|
 | `phys_addr alloc(size_t bytes = page_size, size_t align = page_size)` | A physical region of at least `bytes`, aligned to `max(align, page_size)`. `no_memory` if `bytes` is 0. Aborts the kernel if no free region fits. |
+| `phys_addr try_alloc(size_t bytes = page_size, size_t align = page_size)` | The same, returning `no_memory` instead of aborting when nothing fits. |
 | `void free(phys_addr addr, size_t bytes = page_size)` | Returns a region. `bytes` must be what `alloc()` was given: the same rounding is applied to find the region true size. |
 
 Rounding: `bytes` becomes a whole number of frames; up to one block (512
@@ -68,7 +69,8 @@ frames) that count is rounded up to a power of two, above it it is exact. A
 
 Running out of memory is fatal: when no free region fits, `alloc()` aborts the
 kernel. A request for a block or more can do so while smaller runs are still
-free, since it needs contiguous frames.
+free, since it needs contiguous frames. A caller that can make room itself, a
+cache that evicts for instance, uses `try_alloc()` and handles `no_memory`.
 
 Before `init()`, `alloc()` is served from `boot_alloc()`.
 
@@ -182,6 +184,15 @@ Set by the hardware on the entries it uses; read and reset here.
 | `bool accessed(range r)`, `bool dirty(range r)` | Whether any entry in `r` has the bit set. |
 | `void clear_accessed(range r)`, `void clear_dirty(range r)` | Clears the bit on every entry, flushing. |
 | `void clear_dirty(range r, pending_invalidation &stale)` | The same, with the flush deferred. |
+| `size_t accessed_bits(range r, uint64_t *bits, size_t nbits)`, `size_t dirty_bits(...)` | One bit per page of `r`, set where the present entry has the bit. Returns the pages reported, capped at `nbits`. |
+| `size_t clear_accessed_bits(range r, uint64_t *bits, size_t nbits, pending_invalidation &stale)`, `size_t clear_dirty_bits(...)` | The same, taking the bit away as it is read, with the flush deferred. |
+
+The bitmap forms answer for every page in one walk, where `accessed(range)`
+answers for the range as a whole and a per-page answer would cost a walk each.
+Bit *i* is the page at `r.start + i * page_size`, and an entry larger than a
+page sets every bit it covers. Where the hardware does not track writes,
+`dirty_bits()` reports every present page and `clear_dirty_bits()` changes
+nothing, matching `dirty()` and `clear_dirty()`.
 
 ---
 

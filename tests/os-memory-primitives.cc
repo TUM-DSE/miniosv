@@ -794,6 +794,41 @@ void frames_alloc()
     }
 }
 
+void frames_try_alloc()
+{
+    function("frames::try_alloc");
+
+    test("a request that fits is served exactly as alloc() would");
+    {
+        fr::phys_addr p = fr::try_alloc();
+        CHECK(p != fr::no_memory);
+        CHECK(p % page == 0);
+        memset(view(p), 0x5a, page);
+        fr::free(p);
+    }
+
+    test("zero bytes is no_memory, as for alloc()");
+    {
+        CHECK(fr::try_alloc(0) == fr::no_memory);
+    }
+
+    test("a request nothing can satisfy returns instead of aborting");
+    {
+        CHECK(fr::try_alloc(fr::total_available_bytes() + huge) == fr::no_memory);
+        fr::phys_addr p = fr::try_alloc();
+        CHECK(p != fr::no_memory);
+        fr::free(p);
+    }
+
+    test("alignment is honoured");
+    {
+        fr::phys_addr p = fr::try_alloc(page, huge);
+        CHECK(p != fr::no_memory);
+        CHECK(p % huge == 0);
+        fr::free(p, page);
+    }
+}
+
 void frames_free()
 {
     function("frames::free");
@@ -1937,6 +1972,118 @@ void mapping_bits()
     }
 }
 
+void mapping_bitmaps()
+{
+    function("mapping::accessed_bits, mapping::dirty_bits, mapping::clear_accessed_bits, "
+             "mapping::clear_dirty_bits");
+
+    test("one bit per page, set for the pages that were touched");
+    {
+        const size_t n = 8;
+        scratch s(n * page);
+        mem::range all = s.range(0, n * page);
+        CHECK(map::populate(all, mem::perm_rw));
+        map::clear_accessed(all);
+        map::clear_dirty(all);
+        map::flush_all();
+
+        uint64_t bits = ~uint64_t(0);
+        CHECK(map::accessed_bits(all, &bits, n) == n);
+        CHECK(bits == 0);
+
+        peek(s.start() + 3 * page);
+        *reinterpret_cast<volatile char *>(s.start() + 5 * page) = 1;
+        CHECK(map::accessed_bits(all, &bits, n) == n);
+        CHECK(bits == ((uint64_t(1) << 3) | (uint64_t(1) << 5)));
+
+        if (map::tracks_writes) {
+            CHECK(map::dirty_bits(all, &bits, n) == n);
+            CHECK(bits == (uint64_t(1) << 5));
+        }
+        map::depopulate(all);
+    }
+
+    test("the bitmap agrees with the per-page predicate");
+    {
+        const size_t n = 64;
+        scratch s(n * page);
+        mem::range all = s.range(0, n * page);
+        CHECK(map::populate(all, mem::perm_rw));
+        map::clear_accessed(all);
+        map::flush_all();
+        for (size_t i = 0; i < n; i += 3) {
+            peek(s.start() + i * page);
+        }
+        uint64_t bits = 0;
+        CHECK(map::accessed_bits(all, &bits, n) == n);
+        for (size_t i = 0; i < n; i++) {
+            CHECK(!!(bits & (uint64_t(1) << i)) == map::accessed(s.range(i * page, page)));
+        }
+        map::depopulate(all);
+    }
+
+    test("clear_accessed_bits reports what it cleared, and a second pass is empty");
+    {
+        const size_t n = 4;
+        scratch s(n * page);
+        mem::range all = s.range(0, n * page);
+        CHECK(map::populate(all, mem::perm_rw));
+        map::clear_accessed(all);
+        map::flush_all();
+        peek(s.start() + page);
+        peek(s.start() + 2 * page);
+
+        uint64_t bits = 0;
+        map::pending_invalidation stale;
+        CHECK(map::clear_accessed_bits(all, &bits, n, stale) == n);
+        CHECK(bits == ((uint64_t(1) << 1) | (uint64_t(1) << 2)));
+        CHECK(stale.count == 2);
+        CHECK(stale.epoch != map::never_flushed);
+        stale.invalidate();
+
+        map::pending_invalidation again;
+        CHECK(map::clear_accessed_bits(all, &bits, n, again) == n);
+        CHECK(bits == 0);
+        CHECK(again.count == 0);
+        again.invalidate();
+        map::depopulate(all);
+    }
+
+    test("nbits caps the report and leaves the rest of the range alone");
+    {
+        const size_t n = 8;
+        scratch s(n * page);
+        mem::range all = s.range(0, n * page);
+        CHECK(map::populate(all, mem::perm_rw));
+        map::clear_accessed(all);
+        map::flush_all();
+        peek(s.start() + 6 * page);
+
+        uint64_t bits = ~uint64_t(0);
+        CHECK(map::accessed_bits(all, &bits, 4) == 4);
+        CHECK(bits == 0);
+        CHECK(map::accessed(s.range(6 * page, page)));
+        map::depopulate(all);
+    }
+
+    test("a large leaf sets every bit it covers");
+    {
+        scratch s(huge, huge);
+        mem::range all = s.range(0, huge);
+        CHECK(map::populate(all, mem::perm_rw, huge));
+        const size_t n = huge / page;
+        std::vector<uint64_t> bits(n / 64, 0);
+        map::clear_accessed(all);
+        map::flush_all();
+        peek(s.start());
+        CHECK(map::accessed_bits(all, bits.data(), n) == n);
+        for (size_t w = 0; w < bits.size(); w++) {
+            CHECK(bits[w] == ~uint64_t(0));
+        }
+        map::depopulate(all);
+    }
+}
+
 void mapping_pending_invalidation()
 {
     function("mapping::pending_invalidation");
@@ -2371,6 +2518,7 @@ int os_memory_primitives_main()
 
     group("frames");
     frames_alloc();
+    frames_try_alloc();
     frames_free();
     frames_accounting();
     frames_perf();
@@ -2391,6 +2539,7 @@ int os_memory_primitives_main()
     mapping_flush();
     mapping_flush_epoch();
     mapping_bits();
+    mapping_bitmaps();
     mapping_pending_invalidation();
     mapping_pte_ref();
     mapping_perf();

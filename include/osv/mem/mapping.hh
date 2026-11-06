@@ -123,6 +123,16 @@ void protect(range r, unsigned perm);
 // Helpers (arch-agnostic)
 bool accessed(range r);
 bool dirty(range r);
+
+// One bit per page of "r" in "bits", set where the present leaf has the bit; a
+// large leaf sets every bit it covers. Returns the pages reported, capped at
+// "nbits". The clear_ forms take the bit away as they read it, recording the
+// flush in "stale". Where the hardware does not track writes, every present
+// leaf counts as dirty and the clear_ form changes nothing.
+size_t accessed_bits(range r, uint64_t *bits, size_t nbits);
+size_t dirty_bits(range r, uint64_t *bits, size_t nbits);
+size_t clear_accessed_bits(range r, uint64_t *bits, size_t nbits, pending_invalidation &stale);
+size_t clear_dirty_bits(range r, uint64_t *bits, size_t nbits, pending_invalidation &stale);
 void clear_accessed(range r);
 void clear_dirty(range r);
 void clear_dirty(range r, pending_invalidation &stale);

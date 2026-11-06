@@ -159,7 +159,7 @@ void init(size_t cores)
 
 }
 
-static phys_addr try_alloc(size_t need, size_t align)
+static phys_addr claim(size_t need, size_t align)
 {
     // One block, which llfree hands out aligned to its own size. The common
     // case, and the only one that does not search.
@@ -174,7 +174,7 @@ static phys_addr try_alloc(size_t need, size_t align)
     return frame == no_frame ? no_memory : phys_of(frame);
 }
 
-phys_addr alloc(size_t bytes, size_t align)
+phys_addr try_alloc(size_t bytes, size_t align)
 {
     if (!bytes) {
         return no_memory;
@@ -184,18 +184,22 @@ phys_addr alloc(size_t bytes, size_t align)
     }
     size_t need = frames_for(bytes);
 
-    phys_addr p;
     if (!llf) {
         void *v = boot_alloc(need << mem::mapping::page_size_shift, align);
-        p = v ? from_linear(v) : no_memory;
-    } else {
-        p = try_alloc(need, align);
+        return v ? from_linear(v) : no_memory;
     }
+    return claim(need, align);
+}
+
+phys_addr alloc(size_t bytes, size_t align)
+{
+    phys_addr p = try_alloc(bytes, align);
     // Running out of memory is fatal: there is nothing to ask for more.
-    if (p == no_memory) {
+    if (p == no_memory && bytes) {
+        size_t need = frames_for(bytes);
         abort("frames: out of memory: no free run of %zu KiB aligned to %zu KiB "
               "(%zu MiB free)\n", need << (mem::mapping::page_size_shift - 10),
-              align >> 10, free_bytes() >> 20);
+              (align < page_size ? page_size : align) >> 10, free_bytes() >> 20);
     }
     return p;
 }

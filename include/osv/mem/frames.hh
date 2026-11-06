@@ -28,6 +28,8 @@ constexpr size_t max_block_bytes = page_size << 9;   // 2 MiB
 * was asked for.
 */
 phys_addr alloc(size_t bytes = page_size, size_t align = page_size);
+// Like alloc(), but returns no_memory instead of aborting when nothing fits.
+phys_addr try_alloc(size_t bytes = page_size, size_t align = page_size);
 void free(phys_addr addr, size_t bytes = page_size);
 
 size_t free_bytes();
