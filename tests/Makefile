@@ -16,6 +16,7 @@
 #   - os-string    : memset()/memcmp() correctness + throughput
 #   - os-memory    : the memory clients: early and the heap, plus malloc/mmap
 #   - os-memory-primitives : vspace, frames and mapping, one header per function
+#   - os-nvme      : the NVMe data path: queues, I/O, and the device ceiling
 #   - os-stress    : concurrency / allocator / TLS stress tests
 
 app-objects =  tests/osv_tests.o
@@ -27,4 +28,5 @@ app-objects += tests/os-backtrace.o
 app-objects += tests/os-string.o
 app-objects += tests/os-memory.o
 app-objects += tests/os-memory-primitives.o
+app-objects += tests/os-nvme.o
 app-objects += tests/os-stress.o

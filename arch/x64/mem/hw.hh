@@ -118,10 +118,11 @@ inline pte pte_with_perm(pte e, unsigned perm)
     return perm ? e & ~pte_none : e | pte_none;
 }
 
-// A permission taken away can still be cached; one handed out cannot.
+// Every permission change needs a flush: the TLB may go on caching the old
+// entry after a permission is handed out, not only after one is taken away.
 inline bool pte_perm_change_needs_flush(unsigned old, unsigned neu)
 {
-    return old & ~neu;
+    return old != neu;
 }
 
 constexpr bool tracks_writes = true;

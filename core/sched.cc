@@ -1149,6 +1149,10 @@ thread::~thread()
     rcu_dispose(_detached_state.release());
 }
 
+// Where the next thread that does not ask for a cpu goes. Round-robin, because
+// there is no load balancer to move it later.
+static std::atomic<unsigned> next_placement{0};
+
 void thread::start()
 {
     assert(_detached_state->st == status::unstarted);
@@ -1158,7 +1162,14 @@ void thread::start()
         return;
     }
 
-    _detached_state->_cpu = _attr._pinned_cpu ? _attr._pinned_cpu : current()->tcpu();
+    if (_attr._pinned_cpu) {
+        _detached_state->_cpu = _attr._pinned_cpu;
+    } else if (cpus.size() > 1) {
+        _detached_state->_cpu =
+            cpus[next_placement.fetch_add(1, std::memory_order_relaxed) % cpus.size()];
+    } else {
+        _detached_state->_cpu = current()->tcpu();
+    }
     remote_thread_local_var(percpu_base) = _detached_state->_cpu->percpu_base;
     remote_thread_local_var(current_cpu) = _detached_state->_cpu;
     _detached_state->st.store(status::waiting);

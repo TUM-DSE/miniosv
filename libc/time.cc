@@ -64,6 +64,14 @@ int usleep(useconds_t usec)
     return 0;
 }
 
+// Nothing interrupts this sleep, so it always completes and returns zero.
+OSV_LIBC_API
+unsigned sleep(unsigned seconds)
+{
+    sched::thread::sleep(std::chrono::seconds(seconds));
+    return 0;
+}
+
 // Convenient inline function for converting std::chrono::duration,
 // of a clock with any period, into the classic Posix "struct timespec":
 template <class Rep, class Period>

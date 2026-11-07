@@ -28,6 +28,7 @@ int os_memmove_main();
 int os_string_main();
 int os_memory_main();
 int os_memory_primitives_main();
+int os_nvme_main();
 
 extern "C" void osv_app_main()
 {
@@ -49,6 +50,8 @@ extern "C" void osv_app_main()
     rc |= os_memory_main();
     printf("\n");
     rc |= os_memory_primitives_main();
+    printf("\n");
+    rc |= os_nvme_main();
     printf("\n");
     rc |= os_stress_main();
 

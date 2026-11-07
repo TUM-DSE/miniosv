@@ -17,6 +17,7 @@
 # Under KVM each vCPU thread is pinned to its own host CPU (vCPU i on host CPU
 # i by default; pick the CPUs with --pin, or opt out with --no-pin).
 
+import signal
 import subprocess
 import sys
 import argparse
@@ -102,6 +103,11 @@ def setup_pflash(arch, code, vars_, pflash_dir, workdir):
     # first-boot device enumeration delays.
     os.makedirs(pflash_dir, exist_ok=True)
     vars_copy = os.path.join(pflash_dir, 'vars.fd')
+    # A run under sudo, which passthrough needs, leaves this file owned by
+    # root, and pflash wants it writable: every later unprivileged run then
+    # fails to open it. Replace one we cannot write to rather than inherit it.
+    if os.path.exists(vars_copy) and not os.access(vars_copy, os.W_OK):
+        os.unlink(vars_copy)
     if not os.path.exists(vars_copy):
         shutil.copy(vars_, vars_copy)
         os.chmod(vars_copy, 0o644)
@@ -315,6 +321,18 @@ def _run_with_tee(cmdline, log_path, pin_cpus=None):
     "Run cmdline, copying its output to both stdout and log_path."
     proc = subprocess.Popen(cmdline, env=os.environ.copy(),
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+    # Being killed must not leave qemu behind. An orphan keeps the boot image
+    # and any passed-through device locked, and the next run then fails with
+    # 'Failed to get "write" lock', which says nothing about the cause. This is
+    # what a wrapper's timeout does: it signals us, not our child.
+    def forward_term(signum, frame):
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    previous_term = signal.signal(signal.SIGTERM, forward_term)
+
     with open(log_path, 'wb') as log:
         try:
             if pin_cpus:
@@ -325,6 +343,7 @@ def _run_with_tee(cmdline, log_path, pin_cpus=None):
                 log.write(data)
                 os.write(sys.stdout.fileno(), data)
             ret = proc.wait()
+            signal.signal(signal.SIGTERM, previous_term)
     return ret
 
 

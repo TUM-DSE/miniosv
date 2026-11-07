@@ -441,16 +441,20 @@ void nvme_driver::enable_write_cache() {
 // I/O queue management
 // ===========================================================================
 
-void *nvme_driver::create_io_queue(int qsize, sched::cpu *target_interrupt_cpu,
-                                   bool interrupts) {
+io_queue_pair *nvme_driver::create_io_queue(int qsize,
+                                            sched::cpu *target_interrupt_cpu,
+                                            bool interrupts) {
   assert(qsize > 1 && qsize < _qsize);
   SCOPE_LOCK(_queue_admin_lock);
 
-  size_t qid = ++_queue_id_counter;
-  assert(qid < (1 << 16) && qid > 0);
-
+  // A queue id is its slot plus one, so the lowest free slot reuses removed ids.
+  size_t slot = 0;
+  while (slot < _io_queues.size() && _io_queues[slot]) {
+    slot++;
+  }
+  size_t qid = slot + 1;
   if (qid > _max_io_queues) {
-    nvme_e("asked for I/O queue %zu of %u allocated", qid, _max_io_queues);
+    printf("nvme: asked for I/O queue %zu of %u allocated\n", qid, _max_io_queues);
     return nullptr;
   }
 
@@ -471,7 +475,8 @@ void *nvme_driver::create_io_queue(int qsize, sched::cpu *target_interrupt_cpu,
   setup_create_io_queue_cmd<nvme_acmd_create_cq_t>(
       &cmd_cq, qid, qsize, NVME_ACMD_CREATE_CQ, queue->cq_phys_addr());
   cmd_cq.iv = iv;
-  cmd_cq.ien = 1;
+  // A polled queue must not raise an interrupt.
+  cmd_cq.ien = interrupts ? 1 : 0;
 
   // Submission queue command.
   nvme_acmd_create_sq_t cmd_sq;
@@ -484,12 +489,19 @@ void *nvme_driver::create_io_queue(int qsize, sched::cpu *target_interrupt_cpu,
   // below and must not be dereferenced afterwards (this used to register the
   // interrupt with a moved-from, i.e. null, pointer).
   io_queue_pair *qp = queue.get();
-  _io_queues.push_back(std::move(queue));
-  assert(target_interrupt_cpu != nullptr);
-  if (!msix_register_completion_interrupt(iv, qp, target_interrupt_cpu)) {
-    nvme_e("no interrupt vector for qid %d; not creating the queue\n", qid);
-    _io_queues.pop_back();
-    return nullptr;
+  if (slot == _io_queues.size()) {
+    _io_queues.push_back(nullptr);
+  }
+  _io_queues[slot] = std::move(queue);
+  // A polled queue has no ISR, so it claims no vector.
+  if (interrupts) {
+    sched::cpu *affinity =
+        target_interrupt_cpu ? target_interrupt_cpu : sched::cpu::current();
+    if (!msix_register_completion_interrupt(iv, qp, affinity)) {
+      printf("nvme: no interrupt vector for qid %zu; not creating the queue\n", qid);
+      _io_queues[slot].reset();
+      return nullptr;
+    }
   }
 
   // The status matters: a rejected create leaves no queue on the controller,
@@ -497,15 +509,15 @@ void *nvme_driver::create_io_queue(int qsize, sched::cpu *target_interrupt_cpu,
   auto cq_res = _admin_queue->submit_and_return_on_completion(
       (nvme_sq_entry_t *)&cmd_cq);
   if (cq_res.sct != 0 || cq_res.sc != 0) {
-    nvme_e("create CQ %d rejected: sct=%#x sc=%#x", qid, cq_res.sct, cq_res.sc);
-    _io_queues.pop_back();
+    printf("nvme: create CQ %zu rejected: sct=%#x sc=%#x\n", qid, cq_res.sct, cq_res.sc);
+    _io_queues[slot].reset();
     return nullptr;
   }
   auto sq_res = _admin_queue->submit_and_return_on_completion(
       (nvme_sq_entry_t *)&cmd_sq);
   if (sq_res.sct != 0 || sq_res.sc != 0) {
-    nvme_e("create SQ %d rejected: sct=%#x sc=%#x", qid, sq_res.sct, sq_res.sc);
-    _io_queues.pop_back();
+    printf("nvme: create SQ %zu rejected: sct=%#x sc=%#x\n", qid, sq_res.sct, sq_res.sc);
+    _io_queues[slot].reset();
     return nullptr;
   }
 
@@ -513,8 +525,8 @@ void *nvme_driver::create_io_queue(int qsize, sched::cpu *target_interrupt_cpu,
     qp->set_polled(true);
   }
 
-  printf("nvme: Created I/O queue pair for qid:%d with size:%d pointer=%p (%s)\n",
-         qid, qsize, qp, interrupts ? "interrupt" : "polled");
+  nvme_d("created I/O queue pair qid:%zu size:%d (%s)", qid, qsize,
+         interrupts ? "interrupt" : "polled");
   return qp;
 }
 
@@ -522,32 +534,38 @@ void nvme_driver::remove_io_user_queue(io_queue_pair *queue) {
   SCOPE_LOCK(_queue_admin_lock);
 
   u32 qid = queue->_id;
+  assert(qid >= 1 && qid <= _io_queues.size());
+  assert(_io_queues[qid - 1].get() == queue);
 
-  // Completion queue command (removed after the SQ per the NVMe spec).
+  // Completion queue command, submitted after the SQ below.
   nvme_acmd_delete_ioq_t cmd_cq;
   setup_delete_io_queue_cmd<nvme_acmd_delete_ioq_t>(
-      &cmd_cq, qid, NVME_ACMD_DELETE_CQ, _io_queues[qid - 1]->cq_phys_addr());
+      &cmd_cq, qid, NVME_ACMD_DELETE_CQ, queue->cq_phys_addr());
 
   // Submission queue command.
   nvme_acmd_delete_ioq_t cmd_sq;
   setup_delete_io_queue_cmd<nvme_acmd_delete_ioq_t>(
-      &cmd_sq, qid, NVME_ACMD_DELETE_SQ, _io_queues[qid - 1]->sq_phys_addr());
+      &cmd_sq, qid, NVME_ACMD_DELETE_SQ, queue->sq_phys_addr());
 
-  // Deleting is best effort: the queue is going away either way, but a refusal
-  // is worth knowing about.
-  auto del_cq = _admin_queue->submit_and_return_on_completion(
-      (nvme_sq_entry_t *)&cmd_cq);
-  if (del_cq.sct != 0 || del_cq.sc != 0) {
-    nvme_e("delete CQ %d refused: sct=%#x sc=%#x", qid, del_cq.sct, del_cq.sc);
-  }
+  // The submission queue goes first: deleting a CQ with an SQ still attached is
+  // invalid, and the controller then keeps the queue.
   auto del_sq = _admin_queue->submit_and_return_on_completion(
       (nvme_sq_entry_t *)&cmd_sq);
   if (del_sq.sct != 0 || del_sq.sc != 0) {
-    nvme_e("delete SQ %d refused: sct=%#x sc=%#x", qid, del_sq.sct, del_sq.sc);
+    printf("nvme: delete SQ %u refused: sct=%#x sc=%#x\n", qid, del_sq.sct,
+           del_sq.sc);
+  }
+  auto del_cq = _admin_queue->submit_and_return_on_completion(
+      (nvme_sq_entry_t *)&cmd_cq);
+  if (del_cq.sct != 0 || del_cq.sc != 0) {
+    printf("nvme: delete CQ %u refused: sct=%#x sc=%#x\n", qid, del_cq.sct,
+           del_cq.sc);
   }
 
-  debugf("nvme: Removed I/O user queue pair for qid:%d with size:%d\n", qid,
-         _qsize);
+  // Drop it, so the object, its slot and its id all come back.
+  _io_queues[qid - 1].reset();
+
+  nvme_d("removed I/O queue pair qid:%d", qid);
 }
 
 // ===========================================================================
@@ -563,7 +581,7 @@ void nvme_driver::enable_msix() {
   unsigned int vectors_num =
       std::min((size_t)_dev.msix_get_num_entries(), sched::cpus.size() + 1);
 
-  printf("we have %i vectors_num\n", vectors_num); 
+  nvme_d("%u msix vectors", vectors_num);
 
   // and not push them; currently i am not sure if this can be done mt so
   // i'll go with that solution to just make it big enough
@@ -579,7 +597,7 @@ bool nvme_driver::msix_register_completion_interrupt(unsigned iv, queue_pair *qp
   auto vec = std::unique_ptr<msix_vector>(new msix_vector(&_dev));
   _msi.assign_isr(vec.get(), [qp]() { qp->process_completions(512); });
 
-  printf("running on isr %i\n", vec.get()->get_vector()); 
+  nvme_d("qid %u completion isr %i", iv, vec.get()->get_vector());
 
   if (!_msi.setup_entry(iv, vec.get())) {
     return false;

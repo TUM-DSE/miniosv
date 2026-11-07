@@ -71,11 +71,12 @@ public:
 
   // --- I/O queue management (public API used by the app/io backend) ---
 
-  // Create an I/O queue pair of the given depth and return an opaque handle
-  // (really an io_queue_pair*). target_interrupt_cpu pins the queue's MSI-X
-  // completion interrupt; nullptr uses the current CPU.
-  void *create_io_queue(int qsize, sched::cpu *target_interrupt_cpu = nullptr,
-                        bool interrupts = true);
+  // Create an I/O queue pair. target_interrupt_cpu pins the MSI-X completion
+  // interrupt, nullptr means the current CPU. With interrupts false the queue is
+  // polled and claims no vector. Returns nullptr if the controller refused it.
+  io_queue_pair *create_io_queue(int qsize,
+                                 sched::cpu *target_interrupt_cpu = nullptr,
+                                 bool interrupts = true);
   void remove_io_user_queue(io_queue_pair *queue);
 
   bool reset_and_destroy_controller();
@@ -84,6 +85,12 @@ public:
   // --- multi-controller registry ---
   static nvme_driver *get_nvme_device(int id);
   const int get_id() { return _id; }
+
+  // Geometry of a namespace, or nullptr if the controller has no such nsid.
+  const nvme_ns_t *ns_info(u32 nsid) const {
+    auto it = _ns_data.find(nsid);
+    return it == _ns_data.end() ? nullptr : it->second;
+  }
 
   // Namespace geometry, keyed by nsid (normally a single entry keyed by 1).
   // Shared (by reference) with every queue_pair so they can size transfers.
@@ -120,17 +127,13 @@ private:
   // --- queues ---
   std::unique_ptr<admin_queue_pair, aligned_new_deleter<admin_queue_pair>>
       _admin_queue;
+  // Indexed by queue id minus one; a null slot is a removed, reusable id.
   std::vector<
       std::unique_ptr<io_queue_pair, aligned_new_deleter<io_queue_pair>>>
       _io_queues;
-  size_t _queue_id_counter = 0;
 
-  // create_io_queue and remove_io_user_queue are called from application
-  // threads -- the fio engine creates one queue per job, all at once -- and
-  // between them they hand out queue ids, grow _io_queues, claim an MSI-X
-  // vector and run an admin command. None of that is safe to interleave: two
-  // threads reading _queue_id_counter together take the same id, and with it
-  // the same interrupt vector and doorbell.
+  // Serialises create_io_queue and remove_io_user_queue: concurrent callers
+  // would otherwise take the same slot, and with it the same id and vector.
   mutex _queue_admin_lock;
 
   // --- controller registers / PCI ---

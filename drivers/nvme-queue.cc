@@ -375,11 +375,8 @@ namespace nvme
         // SYNC NOT WORKING
         if (_sq_full || ((_sq._tail + 1) % _qsize) == _sq._head)
         {
-            // counter++;
-            // if (counter > 10) assert(false);
-            // process_completions(10);
-            // std::cout << "full" << std::endl;
-            return 0;
+            // Nothing was placed, so there will be no completion.
+            return -EBUSY;
         }
 
         assert(!_sq_full);
@@ -394,15 +391,21 @@ namespace nvme
         //    This means we could post the command but need a different cid. To still
         //    use the cid as index to find the corresponding bios we use a matrix
         //    adding columns if we need them
+        // "expected" is reset every time round: a failed compare_exchange
+        // writes back what it found, which would make the next one succeed
+        // against an occupied slot and reuse a command id still in flight.
         u16 cid = _sq._tail;
-
-        bool expected = false;
-        while (!_pending_callbacks_locks[cid_to_row(cid)][cid_to_col(cid)].compare_exchange_strong(expected, true))
+        for (;;)
         {
+            bool expected = false;
+            if (_pending_callbacks_locks[cid_to_row(cid)][cid_to_col(cid)]
+                    .compare_exchange_strong(expected, true))
+            {
+                break;
+            }
             cid += _qsize;
-            auto level = cid_to_row(cid);
-            if (level >= max_pending_levels)
-                return 0; // this should never be the case
+            if (cid_to_row(cid) >= max_pending_levels)
+                return -EBUSY; // every cid is in flight; drain and retry
         }
 
         // Save bio
@@ -433,13 +436,13 @@ namespace nvme
         default:
         {
             nvme_e("Operation not implemented\n");
-            return ENOTBLK;
+            return -ENOTBLK;
         }
 
         }
 
-        ring_sq_doorbell();
-	return 1;
+        // The caller rings the doorbell, so a batch costs one write.
+        return 0;
     }
 
     //  returns number of completions processed (may be 0) or negated on error. -ENXIO in the special case that the qpair is failed at the transport layer.
@@ -484,31 +487,17 @@ namespace nvme
                 _sq._head = cqe.sqhd;
 
                 if (cqe.sc != 0) {
-                    // Completion error. Before aborting, dump the failed command
-                    // and the page buffer it referenced: a bad PRP / invalid page
-                    // (the likely culprit) shows up here as garbage prp1 / magic.
-                    // NOTE: the SQ slot may already be reused; this is best-effort
-                    // diagnostics on a fatal path.
+                    // Report and carry on; the caller sees the status in the
+                    // completion entry. The SQ slot may already have been
+                    // reused, so the command details are best-effort.
                     u16 ecid = cqe.cid;
                     nvme_sq_entry_t *failed = &_sq._addr[ecid % _qsize];
-                    printf("nvme completion error: sc=%d sct=%d cid=%d opc=%d "
-                           "slba=%lu nlb(1based)=%u prp1=0x%lx prp2=0x%lx\n",
+                    nvme_e("completion error: sc=%d sct=%d cid=%d opc=%d "
+                           "slba=%lu nlb(1based)=%u prp1=0x%lx prp2=0x%lx",
                            (int)cqe.sc, (int)cqe.sct, ecid,
                            (int)failed->rw.common.opc, (unsigned long)failed->rw.slba,
                            failed->rw.nlb + 1, (unsigned long)failed->rw.common.prp1,
                            (unsigned long)failed->rw.common.prp2);
-                    if (failed->rw.common.prp1) {
-                        // prp1 -> the leanstore Page (offset 512 in its frame).
-                        // page[0]=GSN, page[2]=magic_debugging_number.
-                        auto *page = reinterpret_cast<u64 *>(
-                            mem::map_phys(failed->rw.common.prp1, NVME_PAGESIZE));
-                        printf("  page(phys->virt)=%p GSN=%lu magic=%lu "
-                               "(in-page offset=0x%lx)\n",
-                               (void *)page, (unsigned long)page[0],
-                               (unsigned long)page[2],
-                               (unsigned long)(failed->rw.common.prp1 & (NVME_PAGESIZE - 1)));
-                    }
-                    assert(false);
                 }
 
                 if (old_sq_head != cqe.sqhd && _sq_full)
@@ -524,14 +513,9 @@ namespace nvme
                 nvme::nvme_pending_req pending_callback = _pending_callbacks[cid_to_row(cid)][cid_to_col(cid)];
                 assert(_pending_callbacks_locks[cid_to_row(cid)][cid_to_col(cid)].compare_exchange_strong(expected, false));
 
-                // cb_args is opaque to the driver: only leanstore happens to put a
-                // size_t payload id at offset 0. Callers may pass any pointer
-                // (including nullptr, e.g. the DMA tests), so guard the deref.
-                trace_nvme_op_resread(
-                    pending_callback.cb.cb_args ? (int)((size_t*)pending_callback.cb.cb_args)[0] : 0,
-                    cid);
+                trace_nvme_op_resread(0, cid);
 
-                pending_callback.cb.cb(pending_callback.cb.cb_args, nullptr);
+                pending_callback.cb.cb(pending_callback.cb.cb_args, &cqe);
 
                 if (pending_callback.prp_list)
                 {
@@ -550,11 +534,13 @@ namespace nvme
             }
         }
 
-        // Ring the CQ head doorbell once for the whole batch instead of on
-        // every completion: the controller only needs the latest head value,
-        // so a single MMIO write per poll replaces one write per CQE.
-        if (counter > 0)
+        // Ring the CQ head doorbell once the unacknowledged count reaches half
+        // the queue, not once per drain: an interrupt per completion makes a
+        // drain a single entry, so per-drain fired on every one.
+        _cq_unacked += (u32)counter;
+        if (counter > 0 && _cq_unacked >= (u32)(_qsize / 2))
         {
+            _cq_unacked = 0;
             mmio_setl(_cq._doorbell, _cq._head);
         }
 

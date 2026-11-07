@@ -52,7 +52,8 @@ enum NVME_COMMAND {
   FLUSH = 2
 };
 
-typedef void (*osv_nvme_cmd_cb)(void *ctx, const nvme_sq_entry_t* cpl);
+// Called once per completion; cpl->sc and cpl->sct carry the status.
+typedef void (*osv_nvme_cmd_cb)(void *ctx, const nvme_cq_entry_t* cpl);
 
 typedef struct osv_nvme_callback {
     osv_nvme_cmd_cb cb;
@@ -114,7 +115,6 @@ public:
     // old design this was the admin queue's req_done() loop.
     virtual int process_completions(int max) = 0;
 
-    void wait_for_completion_queue_entries();
 
     u32 _id;
 
@@ -123,6 +123,10 @@ protected:
     std::atomic<bool> _polled{false};
 
     inline void advance_sq_tail();
+
+    // Completions drained since the CQ head doorbell was last written.
+    u32 _cq_unacked = 0;
+
     inline void advance_cq_head()
     {
         // trace_nvme_cq_head_advance(_driver_id, _id, _cq._head);
@@ -192,10 +196,13 @@ public:
         return _sq_full.load();
     };
 
-    int submit_request(int ns, void *payload, uint64_t lba, uint32_t lba_count, osv_nvme_cmd_cb cb_fn, void *cb_arg, uint32_t io_flags, NVME_COMMAND cmd);
+    // Place one command over [offset_bytes, offset_bytes + len_bytes). Both are
+    // bytes, not blocks, and multiples of the namespace block size; "payload" is
+    // a virtual address. Returns 0, or -EBUSY when the queue is full or every
+    // command id is in flight. A command not placed never completes.
+    int submit_request(int ns, void *payload, uint64_t offset_bytes, uint32_t len_bytes, osv_nvme_cmd_cb cb_fn, void *cb_arg, uint32_t io_flags, NVME_COMMAND cmd);
 
-    // submit_request only places the command; the caller batches submissions and
-    // calls this once per batch.
+    // The caller rings the doorbell, once per batch of submit_request calls.
     using queue_pair::ring_sq_doorbell;
 
     int process_completions(int max) override;
