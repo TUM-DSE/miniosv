@@ -123,6 +123,14 @@ protected:
     std::atomic<bool> _polled{false};
 
     inline void advance_sq_tail();
+    // Completions drained since the CQ head doorbell was last written. The
+    // head doorbell only tells the controller which CQ slots are free, so it
+    // may be written lazily: ringing every _qsize/2 completions cannot stall
+    // the controller, which always sees at least half the queue free and can
+    // post another completion, whose interrupt carries the count to the
+    // threshold.
+    u32 _cq_unacked = 0;
+
     inline void advance_cq_head()
     {
         // trace_nvme_cq_head_advance(_driver_id, _id, _cq._head);
