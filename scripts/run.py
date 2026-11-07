@@ -95,7 +95,7 @@ def find_firmware(arch):
                  % (arch, pkg, prefix, prefix))
     return code, vars_
 
-def setup_pflash(arch, code, vars_, pflash_dir, workdir):
+def setup_pflash(arch, code, vars_, pflash_dir, workdir, image=None):
     # pflash needs a writable copy of the variable store; the aarch64 virt
     # pflash also requires the firmware images to be exactly 64 MiB.
     # We persist vars.fd in the build directory alongside the image so the
@@ -103,11 +103,16 @@ def setup_pflash(arch, code, vars_, pflash_dir, workdir):
     # first-boot device enumeration delays.
     os.makedirs(pflash_dir, exist_ok=True)
     vars_copy = os.path.join(pflash_dir, 'vars.fd')
-    # A run under sudo, which passthrough needs, leaves this file owned by
-    # root, and pflash wants it writable: every later unprivileged run then
-    # fails to open it. Replace one we cannot write to rather than inherit it.
-    if os.path.exists(vars_copy) and not os.access(vars_copy, os.W_OK):
-        os.unlink(vars_copy)
+    # Two reasons to throw the store away rather than inherit it. It records a
+    # boot entry for one particular image, so after a rebuild the firmware can
+    # stop at "No bootable option or device was found", which reads as a kernel
+    # that will not boot. And a run under sudo, which passthrough needs, leaves
+    # it owned by root, so every later unprivileged run fails to open it.
+    if os.path.exists(vars_copy):
+        stale = (image and os.path.exists(image) and
+                 os.path.getmtime(vars_copy) < os.path.getmtime(image))
+        if stale or not os.access(vars_copy, os.W_OK):
+            os.unlink(vars_copy)
     if not os.path.exists(vars_copy):
         shutil.copy(vars_, vars_copy)
         os.chmod(vars_copy, 0o644)
@@ -215,7 +220,8 @@ def start_osv_qemu(options):
     pflash_dir = os.path.dirname(os.path.abspath(options.image_file))
     try:
         code, vars_ = find_firmware(options.arch)
-        code_copy, vars_copy = setup_pflash(options.arch, code, vars_, pflash_dir, workdir)
+        code_copy, vars_copy = setup_pflash(options.arch, code, vars_, pflash_dir,
+                                            workdir, options.image_file)
 
         use_kvm = options.hypervisor == 'kvm'
         pin_cpus = choose_pinning(options)

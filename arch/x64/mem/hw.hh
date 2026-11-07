@@ -92,7 +92,12 @@ inline pte pte_make_table(frames::phys_addr p)
 
 inline pte pte_make_leaf(frames::phys_addr p, unsigned perm, unsigned level, mattr)
 {
-    pte e = p | pte_u | pte_a | pte_d;
+    // Not pte_a | pte_d: x86 sets both in hardware, without faulting, so
+    // presetting them only costs the accessed and dirty accessors their meaning
+    // -- a freshly mapped page would read as touched and written. aarch64
+    // presets its access flag because an access with it clear faults there, and
+    // maps writable pages clean for the same reason this does.
+    pte e = p | pte_u;
     if (perm) {
         e |= pte_p;
     }

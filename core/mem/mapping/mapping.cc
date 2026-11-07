@@ -382,10 +382,13 @@ bool populate(range r, unsigned perm, size_t leaf_size, bool zero)
 void depopulate(range r)
 {
     pending_invalidation stale;
+    // Frames held back for one flush. Its own bound, not flush_batch's: that is
+    // tunable, and this array is 16 bytes an entry on a fault-path stack.
+    constexpr unsigned free_batch = 32;
     struct {
         frames::phys_addr addr;
         size_t size;
-    } frame[flush_batch];
+    } frame[free_batch];
     unsigned held = 0;
 
     auto give_back = [&] {
@@ -399,7 +402,7 @@ void depopulate(range r)
 
     walk_result res;
     clear_range(page_align(r), res, true, [&](uintptr_t va, frames::phys_addr addr, size_t size) {
-        if (held == flush_batch) {
+        if (held == free_batch) {
             give_back();
         }
         stale.add(va);

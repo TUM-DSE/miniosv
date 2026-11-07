@@ -26,6 +26,13 @@
 #ifndef CONF_interrupt_stack_size
 #define CONF_interrupt_stack_size 0x2000
 #endif
+// Addresses a pending_invalidation names before it gives up on being precise
+// and invalidates the whole TLB. Both cost one shootdown, so this trades that
+// many invlpg against losing every other translation; 8 to 256 is sane, and
+// depopulate's frame batch is deliberately independent of it.
+#ifndef CONF_mem_flush_batch
+#define CONF_mem_flush_batch 32
+#endif
 #ifndef CONF_lazy_stack
 #define CONF_lazy_stack 0
 #endif

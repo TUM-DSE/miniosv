@@ -8,6 +8,7 @@
 #ifndef OSV_MEM_MAPPING_HH
 #define OSV_MEM_MAPPING_HH
 
+#include <osv/kernel_config.h>
 #include <osv/mem/types.hh>
 #include <mem.hh>
 
@@ -26,7 +27,11 @@ constexpr unsigned level_of(size_t leaf_size)
     return leaf_size >= huge_page_size ? 1 : 0;
 }
 
-constexpr size_t flush_batch = 32;
+// Addresses one pending_invalidation holds, and so the point at which it stops
+// naming them and invalidates the whole TLB instead. Both forms cost one
+// shootdown, so the trade is this many invlpg against losing every other
+// translation. Tunable: see osv/kernel_config.h.
+constexpr size_t flush_batch = CONF_mem_flush_batch;
 
 // Pointer to a PTE with additional metadata for management.
 class pte_ref {
