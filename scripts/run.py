@@ -100,6 +100,8 @@ def setup_pflash(arch, code, vars_, pflash_dir, workdir):
     # first-boot device enumeration delays.
     os.makedirs(pflash_dir, exist_ok=True)
     vars_copy = os.path.join(pflash_dir, 'vars.fd')
+    if os.path.exists(vars_copy) and not os.access(vars_copy, os.W_OK):
+        os.unlink(vars_copy)
     if not os.path.exists(vars_copy):
         shutil.copy(vars_, vars_copy)
         os.chmod(vars_copy, 0o644)

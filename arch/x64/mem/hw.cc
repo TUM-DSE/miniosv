@@ -14,6 +14,7 @@
 #include <osv/mem/mapping.hh>
 #include <osv/migration-lock.hh>
 #include <osv/sched.hh>
+#include <osv/spinlock.h>
 
 #include "arch-cpu.hh"
 
@@ -47,8 +48,7 @@ void tlb_flush_local()
     processor::write_cr3(processor::read_cr3());
 }
 
-static mutex flush_mutex;
-static sched::thread_handle flush_waiter;
+static spinlock flush_lock;
 static std::atomic<int> flush_pendingconfirms;
 
 // List of addresses to flush.
@@ -62,9 +62,7 @@ static inter_processor_interrupt flush_ipi{IPI_TLB_FLUSH, [] {
         } else {
             tlb_flush_local();
         }
-        if (flush_pendingconfirms.fetch_add(-1) == 1) {
-            flush_waiter.wake_from_kernel_or_with_irq_disabled();
-        }
+        flush_pendingconfirms.fetch_add(-1, std::memory_order_release);
 }};
 
 /*
@@ -85,9 +83,10 @@ static void shootdown(const uintptr_t *va, size_t count)
         return;
     }
 
+    assert(arch::irq_enabled());
+
     SCOPE_LOCK(migration_lock);
-    std::lock_guard<mutex> guard(flush_mutex);
-    flush_waiter.reset(*sched::thread::current());
+    std::lock_guard<spinlock> guard(flush_lock);
     // Every cpu, whatever it runs: kernel memory is unmapped and reused too
     // (the heap gives its pages back), so a cpu running a kernel thread may
     // hold a stale entry and touch it before it next switches threads.
@@ -95,15 +94,14 @@ static void shootdown(const uintptr_t *va, size_t count)
 
     flush_va_count.store(count, std::memory_order_relaxed);
     flush_va.store(va, std::memory_order_release);
-    flush_pendingconfirms.store(confirms);
+    flush_pendingconfirms.store(confirms, std::memory_order_release);
     flush_ipi.send_allbutself();
 
     flush_here();
 
-    sched::thread::wait_until([] {
-            return flush_pendingconfirms.load() == 0;
-    });
-    flush_waiter.clear();
+    while (flush_pendingconfirms.load(std::memory_order_acquire) != 0) {
+        processor::spin_hint();
+    }
 }
 
 void tlb_flush_all()

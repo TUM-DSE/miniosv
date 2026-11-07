@@ -2493,6 +2493,49 @@ void mapping_perf()
         report_ns("find, 4 KiB leaf", since(t0), probes);
         map::depopulate(s.range(0, huge));
     }
+
+    section("shootdown, every cpu at once");
+    {
+        // What a buffer manager reclaiming pages does: unmap on every core at
+        // the same time. One shootdown is an IPI round trip and the hardware
+        // cost of it does not grow with the number of initiators, so the
+        // ns/op column shows what the kernel adds on top: how far shootdowns
+        // serialise against one another, and whether the initiator pays a
+        // context switch while it waits.
+        //
+        // Up to every cpu: the cost of a shootdown is the cost of waiting for
+        // all of them, so the thread count is the point of the measurement.
+        const unsigned max = n_cpus();
+        const size_t batch = map::flush_batch;
+
+        // A low floor, because the work is serialised: at 128 threads even a
+        // few hundred shootdowns each is tens of seconds of wall time.
+        for (unsigned t = 1; t <= max; t *= 2) {
+            const int n = share(20000, t, 200);
+            double s_all = parallel(t, [&](unsigned) {
+                for (int i = 0; i < n; i++) {
+                    map::flush_all();
+                }
+            });
+            report_scale("flush_all", t, double(n) * t, s_all);
+        }
+
+        // Addresses, not whole-TLB: the same path a batched detach takes.
+        // They need not be mapped -- invalidating an address that has no entry
+        // is what the cpu does for most of a batch anyway -- but each thread
+        // names its own, so no two shootdowns cover the same page.
+        scratch s2(max * batch * page);
+        for (unsigned t = 1; t <= max; t *= 2) {
+            const int n = share(20000, t, 200);
+            double s_rng = parallel(t, [&](unsigned id) {
+                mem::range r = s2.range(id * batch * page, batch * page);
+                for (int i = 0; i < n; i++) {
+                    map::flush_range(r);
+                }
+            });
+            report_scale("flush_range, 32 pages", t, double(n) * t, s_rng);
+        }
+    }
 }
 
 /* misc -------------------------------------------------------------------- */
