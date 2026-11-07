@@ -94,13 +94,31 @@ The page table architecture and format are supplied via the arch-specific header
 ```cpp
 constexpr size_t page_size      = 4 KiB;
 constexpr size_t huge_page_size = 2 MiB;
-constexpr size_t flush_batch    = 32;
+constexpr size_t flush_batch    = CONF_mem_flush_batch;  // 32 by default
 extern uint8_t phys_bits, virt_bits;   // what the hardware reports
 ```
 
 Every function taking a `range` first widens it to whole pages.
 
-`pte_ref` is a struct used to hold a pointer to a leaf in the page table. It can be both last level (4KiB, Page Table Entry) or one-before-last level (2MiB, Page Directory Entry). Most clients and applications don't need to operate at this level so we omit it in this document.
+`pte_ref` holds a pointer to a leaf slot in the page table, either last level
+(4 KiB, a page table entry) or one before last (2 MiB, a page directory entry).
+It carries the level with it, so `size()`, `addr()` and `leaf_for()` answer for
+the right leaf size. Most clients never need it: `attach` and `detach` do the
+walk for them.
+
+Two things a client using one should know.
+
+**It may be kept.** A `pte_ref` is a value, the slot pointer plus the level, and
+holds nothing of its own. Keeping one per address instead of calling `find`
+again makes a map or unmap a single `write()` rather than a walk from the root.
+
+**It dangles once the table under it is freed.** `detach` and `depopulate` free
+the tables they empty; `detach_deferred` does not. So a client that builds its
+tables with `prepare` and clears only with `detach_deferred` may keep a
+`pte_ref` for the life of the mapping.
+
+After writing through one, call `barrier()`, and invalidate the entry it
+replaced.
 
 ### Translation
 
@@ -133,8 +151,8 @@ permissions in place. `detach_deferred` clears the entries and accumulate stale 
 
 | Function | Does |
 |---|---|
-| `void detach(range r)` | Clears the entries and flushes the TLB for `r` on every cpu. Frames are not freed. |
-| `void detach_deferred(range r, pending_invalidation &stale)` | Same as `detach` but avoid TLB flushes. Accumulate stale TLB entries at the tail of `stale` (must be owned by the caller). |
+| `void detach(range r)` | Clears the entries and flushes the TLB for `r` on every cpu. Frames are not freed. Reclaims any page table it empties, so a `pte_ref` into `r` does not survive the call. |
+| `void detach_deferred(range r, pending_invalidation &stale)` | Same as `detach` but issues no flush: it records the cleared addresses at the tail of `stale`, which the caller owns and must `invalidate()`. Leaves the page tables standing, so a `pte_ref` into `r` stays valid. |
 | `void depopulate(range r)` | Detaches and frees the frames, in batches of `flush_batch`, flushing before each batch is freed. |
 | `void protect(range r, unsigned perm)` | Rewrites the permissions of every mapped entry in `r`. Flushes only the entries whose change the arch says needs it. |
 | `void split(range r)` | Breaks every 2 MiB leaf in `r` into 4 KiB leaves. |
@@ -168,6 +186,18 @@ struct pending_invalidation {
 ```
 
 `add()` records an address, or sets `all` if past `flush_batch`.
+
+Once `all` is set the list has stopped being precise: `invalidate()` flushes
+every entry on every cpu rather than naming addresses. Both forms cost one
+shootdown, so for a large batch the whole-TLB form is the cheaper of the two --
+but it also costs the caller every other translation it held, which it then
+re-walks. A caller clearing more than `flush_batch` addresses at a time has
+three choices: raise `CONF_mem_flush_batch`, call `invalidate()` more often so
+each batch stays under it, or name the addresses itself with
+`tlb_flush_pages_all(va, count)`, which takes a count of any size. The last one
+flushes without touching the epoch, so a caller that uses it is responsible for
+the ordering `pending_invalidation` would otherwise handle: the flush must
+complete before the frames behind those entries are reused.
 
 `invalidate()` ensures that the virtual memory do not have stale TLB entries in any core.
 This can happen in two cases:

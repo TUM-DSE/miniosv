@@ -328,16 +328,19 @@ def _run_with_tee(cmdline, log_path, pin_cpus=None):
     proc = subprocess.Popen(cmdline, env=os.environ.copy(),
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
-    # Being killed must not leave qemu behind. An orphan keeps the boot image
-    # and any passed-through device locked, and the next run then fails with
-    # 'Failed to get "write" lock', which says nothing about the cause. This is
-    # what a wrapper's timeout does: it signals us, not our child.
     def forward_term(signum, frame):
         try:
             proc.terminate()
         except Exception:
             pass
     previous_term = signal.signal(signal.SIGTERM, forward_term)
+
+    pidfile = os.path.join(pflash_dir, 'qemu.pid')
+    try:
+        with open(pidfile, 'w') as fh:
+            fh.write('%d\n' % proc.pid)
+    except OSError:
+        pidfile = None
 
     with open(log_path, 'wb') as log:
         try:
@@ -350,6 +353,11 @@ def _run_with_tee(cmdline, log_path, pin_cpus=None):
                 os.write(sys.stdout.fileno(), data)
             ret = proc.wait()
             signal.signal(signal.SIGTERM, previous_term)
+            if pidfile:
+                try:
+                    os.unlink(pidfile)
+                except OSError:
+                    pass
     return ret
 
 
